@@ -35,10 +35,30 @@ func main() {
 			return
 		}
 		// You can use print statements as follows for debugging, they'll be visible when running tests.
-		fmt.Println("Logs from your program will appear here!")
+		//fmt.Println("Logs from your program will appear here!")
 
 		// Uncomment this to pass the first stage
-		fmt.Printf("database page size: %v", pageSize)
+		fmt.Printf("database page size: %v\n", pageSize)
+
+		//!By default it is page 1 is at offset zero and contains sqlite_schema.
+		//!var default offset with the size 100
+
+		pageHeader := make([]byte, 12)
+		_, err = databaseFile.Read(pageHeader)
+		if err != nil {
+			log.Fatal(err)
+		}
+		
+		var cellsCount uint16;
+		if err := binary.Read(bytes.NewReader(pageHeader[3:5]), binary.BigEndian, &cellsCount); err != nil {
+			fmt.Println("Failed to get cell count:", err)
+			return
+		}
+
+		intCellCount := int(cellsCount);
+		// Logging the cell count, which is same as tables count in this case, since we don't have other things like index, views, triggers etc.
+		fmt.Printf("number of tables: %v", intCellCount)
+
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
