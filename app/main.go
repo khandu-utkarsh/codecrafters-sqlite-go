@@ -6,16 +6,66 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"math"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
 
-func decodeContentSize(serialType int64) {
+func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {	
+	switch serialType {
+	case 0:
+		return 0, null
+	case 1:
+		val8 := int8(raw[0]);
+		return 1, int64(val8);
+	case 2:
+		val16 := int16(binary.BigEndian.Uint16(raw[:2]))
+		return 2, int64(val16);
+	case 3:
+		value32:= int32(raw[0]) << 16 | int32(raw[1]) << 8 | int32(raw[2]);
+		if value32 & 0x800000 != 0 {
+			value32 |= 0xFF000000
+		}
+		return 3, int64(value32);
+	case 4:
+		val32 := int32(binary.BigEndian.Uint32(raw[:4]))
+		return 4, int64(val32);
+	case 5:
+		val48 := int64(raw[0])<<40 | int64(raw[1])<<32 | int64(raw[2])<<24 | int64(raw[3])<<16 | int64(raw[4])<<8 | int64(raw[5])
 
+		// Check if the sign bit (48th bit) is set
+		if val48 & 0x800000000000 != 0 {
+			// Extend the sign to 64 bits if the 48th bit is set
+			val48 |= 0xFFFF000000000000
+		}
+		return 6, val48;
+	case 6:
+		val64 := int64(binary.BigEndian.Uint64(raw[:8]))
+		return 8, int64(val64);
+	case 7:
+		floatVal64 := math.Float64frombits(binary.BigEndian.Uint64(raw[:8]));
+		return 8, floatVal64;
+	case 8:
+		return 0, 0
+	case 9:
+		return 0, 0
+	default:
+		if serialType%2 == 0 && serialType >= 12 {
+			serialBytesCount := (serialType - 12) / 2
+			return serialBytesCount, raw[0:serialBytesCount];
+		} else if serialType%2 != 0 && serialType > 13 {
+			serialBytesCount := (serialType - 13) / 2
+			return serialBytesCount, string(raw[0:serialBytesCount]);
+		}
+	}
+	return -1, nil // Add a return statement in case none of the cases match
 }
 
 
+
 func parseRecord(recordRaw []byte, headerSize int64) {
+
+	//!Record is basically each row of the table or index. 
 	totalBytesCountHeader, hSize := binary.Varint(recordRaw);
 
 	var currOffset int64;
@@ -24,24 +74,19 @@ func parseRecord(recordRaw []byte, headerSize int64) {
 	colIndex := 0;
 
 	var colsSerialTypes []int64
-	var colContents [][]byte
+	var colContents []interface{}
+
+	contentBytesOffset := totalBytesCountHeader;
 
 	for currOffset < totalBytesCountHeader {
-		serialType, bytesRead := binary.Varint(recordRaw);
+		serialType, bytesRead := binary.Varint(recordRaw[currOffset : ]);
+		bytesReadForContent, contentValue := interpretBytes(serialType, recordRaw[contentBytesOffset:])	
+		currOffset += int64(bytesRead);
+		contentBytesOffset += int64(bytesReadForContent);
 		colsSerialTypes = append(colsSerialTypes, serialType);
+		colContents = append(colContents, contentValue);
+		
 	}
-
-	//!Start reading from headerSizeOffset. And keep on interpretting everything
-
-
-
-	A record contains a header and a body, in that order. 
-	The header begins with a single varint which determines the total number of bytes in the header. 
-	The varint value is the size of the header in bytes including the size varint itself. 
-	Following the size varint are one or more additional varints, one per column. 
-	These additional varints are called "serial type" numbers and determine the datatype of each column, according to the following chart:
-
-
 
 }
 
