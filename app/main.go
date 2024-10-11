@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"os"
 	"math"
+	"os"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
@@ -63,7 +63,7 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 
 
 
-func parseRecord(recordRaw []byte, headerSize int64) {
+func parseRecord(recordRaw []byte) {
 
 	//!Record is basically each row of the table or index. 
 	totalBytesCountHeader, hSize := binary.Varint(recordRaw);
@@ -90,96 +90,55 @@ func parseRecord(recordRaw []byte, headerSize int64) {
 
 }
 
-
-func parsePage(rawBytes []byte, pageSize int, firstPage bool) {
-	//!Since cell pointers are from beginning of the page, it is better to send whole page.
-
-
+//!Since offset on each page are from beginning, so it is better to read the whole page and continue.
+func getCellPointersOnPage(pageBytes []byte, pageSize int64, firstPage bool) []uint16 {
+	//!If first page, there will be file header, else page won't have file header, it will directly have page header
 	//!If it is the first page, page size will be 100 bytes less which has removed the header.
-	var pageHeaderIndex int
+
+	var fileHeaderOffset int64
+	fileHeaderOffset = 0;
 	if(firstPage) {
-		pageHeaderIndex = 100;
-	} else {
-		pageHeaderIndex = 0;
+		fileHeaderOffset = 100;
 	}
-
-	var pageHeaderSize int
-	if rawBytes[pageHeaderIndex] == 0x05 || rawBytes[pageHeaderIndex] == 0x02 {	//!Interior table page.
-		pageHeaderSize = 12;
+	
+	//!Get the size of page header, which is first byte after file header (and first byte on page if no page header)
+	var pageHeaderSizeInBytes int64
+	if rawBytes[fileHeaderOffset] == 0x05 || rawBytes[fileHeaderOffset] == 0x02 {	//!Interior table page.
+		pageHeaderSizeInBytes = 12
 	}	else {
-		pageHeaderSize = 8;
+		pageHeaderSizeInBytes = 8
 	}
 
-	//!Next step is to get the cell count on the page.
-	var cellCount uint16;
-	cellCountBytes := bytes.NewReader(rawBytes[pageHeaderIndex + 3: pageHeaderIndex + 5]);
-	binary.Read(cellCountBytes, binary.BigEndian, &cellCount);
+	currOffset := fileHeaderOffset;
 
-	k = int(cellCount);
+	//!Cells count on page
+	cellsCount := int64(binary.BigEndian.Uint16(pageBytes[currOffset + 3 : currOffset + 5]))
 
-	cellPointers := make([]uint16, k);
+	currOffset += currOffset + pageHeaderSizeInBytes;
 
-	cellPointerArrayOffset := pageHeaderIndex + pageHeaderSize;
-
-	//!Now read cell pointer array and store them.
-	for i := 0; i < k; i++ {
-		currentPointerBytesReader := bytes.NewReader(rawBytes[cellPointerArrayOffset + (k *2) : cellPointerArrayOffset + (k + 1)* 2]);
-		binary.Read(currentPointerBytesReader, binary.BigEndian, &(cellPointers[i]));
+	//!Get pointers to all the cells.
+	cellPointers := make([]uint16, cellsCount);
+	for i := 0; i < cellsCount; i++ { 		//!2 bytes is the cell size
+		cellPointers[i] = binary.BigEndian.Uint16(pageBytes[currOffset + 2 * i : currOffset + 2 * (i + 1)])
     }
 
-	for i := 0; i <k; i++ {
-		currCellPointer := cellPointers[i];
-		//!total bytes of playload
-		//!Since max size of varint would be 9 bytes, we can pass only 9 bytes for interpretation.
-
-		payloadSize, sizeBytesRead := binary.Varint(rawBytes[currCellPointer : currCellPointer + 9]);
-		_, rowIdBytesRead := binary.Varint(rawBytes[currCellPointer +uint16(sizeBytesRead) : currCellPointer + uint16(sizeBytesRead) + 9]);
-
-		//!byte array of payload
-		//!This will be the record format:		
-		currCellPayload := rawBytes[uint64(currCellPointer) +uint64(sizeBytesRead)+uint64(rowIdBytesRead) : uint64(currCellPointer)+uint64(sizeBytesRead)+uint64(rowIdBytesRead)+uint64(payloadSize)]
-// fmt.Printf("payload: %v\n", string(record))
-
-
-
-	}
-
-	//!There cell pointers are basically offset from top of the page. From 0
-	
-	//!Note:
-	//!Also harding coding it to be Table B-Tree Leaf Cell 
-	//!Also, no overflow will happen, so no need to worry about it.
-
-
-
-
-
-	//!At this point we have gotten pointer to every cell on this page. --> Next step would be to go to these cells and get the name
-
-
-
-
-
-
-
+	return cellPointers;
 }
 
 
-// InterpretPageHeader interprets the B-tree page type from a single byte.
-func GetCellContentStartOffset(i byte) int {
-	switch i {
-	case 0x02:	//!This is interior b-tree page.
-		return 12;
-	default:	//!All rest headers are of size 8
-		return 8;
-	}
+//!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
+//!Also assumption is that there is no overflow
+func readCell(pageBytes []byte, cellOffset uint16) {
+	payloadSizeInBytes, sizeBytesRead := binary.Varint(pageBytes[cellOffset : cellOffset + 9]);
+	currOffset := cellOffset + uint16(sizeBytesRead);
+	_, rowIdBytesRead := binary.Varint(pageBytes[currOffset : currOffset + 9]);
+	currOffset += uint16(rowIdBytesRead);
+	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + payloadSizeInBytes];
+
+	//!Parse this record
+	parsedRecord := parseRecord(currCellPayloadBytes);
+	return parsedRecord
 }
-
-func ReadLeafTableBTreePage()
-{
-
-}
-
 
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
