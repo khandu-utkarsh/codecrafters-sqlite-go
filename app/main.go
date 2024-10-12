@@ -12,25 +12,49 @@ import (
 	// "github.com/xwb1989/sqlparser"
 )
 
-func getRootPageForTable(tableName string, pageBytes []byte) int64 {
+func parseColNamesFromSQLStr(sql string) []string {
+	indStart := strings.Index(sql, "(");
+	indEnd := strings.Index(sql, ")");
 
+	colsDetails := sql[indStart + 1 : indEnd];
+	colsDetails = strings.Trim(colsDetails, " ");
+	splitted := strings.Split(colsDetails, ",");
+
+	var colNames []string;
+	for _, col := range splitted {
+		colSp := strings.Split(col, " ");
+		colNameCol := strings.Trim(colSp[0], "\n\t");
+		colNames = append(colNames, colNameCol);
+	}
+	return colNames;
+}
+
+func getRootPageAndCreationStrForTable(tableName string, pageBytes []byte) (int64, string) {
 	//!First page will have sql_schema table and need to go through each row having info of the table and extract table name from it.
 	cellPointers := getCellPointersOnPage(pageBytes, true);
 
 	var tableRootPage int64;
 
+	pageFound := false;
+	var cellColsContent []interface{};
+	var sqlStr string;
 	// Iterate using range
 	for _, cellPointer := range cellPointers {
-		_, cellColsContent := readCell(pageBytes, cellPointer);
+		_, cellColsContent = readCell(pageBytes, cellPointer);
 		//!If the name of the table is equal to the supplied name, extract the root page.
 		//!Schema table consists of type, name, tbl_name, ... ...
 		nameCol := cellColsContent[1].(string);
 		if(nameCol == tableName) {	//!Since it won't be a float or string or blob, hence it will always return int64
 			tableRootPage = cellColsContent[3].(int64);
-			return tableRootPage;
+			sqlStr = cellColsContent[4].(string);
+			pageFound = true;		
+			break;
 		}
 	}
-	return -1;
+	if(!pageFound) {
+		return int64(-1), sqlStr;
+	}
+	return tableRootPage, sqlStr;
 }
 
 
@@ -292,6 +316,7 @@ func main() {
 	case "SELECT":		
 		splitted := strings.Split(commandRead, " ");
 		var tableName string;
+		selectQuantity := splitted[1];
 		tableName  = splitted[len(splitted) - 1];
 
 		databaseFile, err := os.Open(databaseFilePath)
@@ -314,20 +339,67 @@ func main() {
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
 
-		tablePageNo := int64(getRootPageForTable(tableName, pageBytes));
+		tablePageNo, sqlStr := getRootPageAndCreationStrForTable(tableName, pageBytes);
+		//fmt.Println(sqlStr); //!For debugging.
+		colNames := parseColNamesFromSQLStr(sqlStr);
+
+		var colIndex int;
+		colIndex = -1;
+		for iCol, col := range colNames {
+			if(col == selectQuantity) {
+				colIndex = iCol;
+				break;
+			}
+		}
+
+		giveRowsCount := false;
+		if(colIndex == -1) {
+			giveRowsCount = true;
+		}
+
+
 		tablePageOffset := getPageOffset(tablePageNo, int64(pageSize));
-			
 		tablePageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
 
 		//!All the rows on the page.
-		cellPointers := getCellPointersOnPage(tablePageBytes, false);
-		//!Number of rows would be equal to number of cell pointers:
-		fmt.Println((len(cellPointers)));
+		cellPointers := getCellPointersOnPage(tablePageBytes, false);		
+		if(giveRowsCount) {
+			fmt.Println((len(cellPointers)));
+		} else {		
+			//!Iterating over each roww (record)
+
+			var decodeInto int64;
+			var colRows []interface {};
+			for _, cellPointer := range cellPointers {
+				colSerialTypes, cellColsContent := readCell(tablePageBytes, cellPointer);
+
+				reqColSerialType := colSerialTypes[colIndex];
+				decodeInto = reqColSerialType;
+				reqColContent :=  cellColsContent[colIndex];
+				colRows = append(colRows, reqColContent);
+			}
+			for _, row := range colRows {
+				if (decodeInto == 7) {
+					curr := row.(float64);
+					fmt.Println(curr);
+					//!Req content is float
+				} else if(decodeInto%2 == 0 && decodeInto >= 12) {
+					curr := row.([]byte)
+					fmt.Println(curr);
+				} else if(decodeInto%2 != 0 && decodeInto > 13) {
+					//!String	
+					curr := row.(string);
+					fmt.Println(curr);
+					} else {
+					//!Int 64	
+					curr := row.(int64);
+					fmt.Println(curr);
+				}
+			}
+
+		}
 		databaseFile.Close();
-
-
-
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
