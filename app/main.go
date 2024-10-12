@@ -14,7 +14,7 @@ import (
 func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {	
 	switch serialType {
 	case 0:
-		return 0, null
+		return 0, nil
 	case 1:
 		val8 := int8(raw[0]);
 		return 1, int64(val8);
@@ -24,7 +24,8 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 	case 3:
 		value32:= int32(raw[0]) << 16 | int32(raw[1]) << 8 | int32(raw[2]);
 		if value32 & 0x800000 != 0 {
-			value32 |= 0xFF000000
+			value32 |= -1 << 24
+			// value32 |= 0xFF000000
 		}
 		return 3, int64(value32);
 	case 4:
@@ -36,7 +37,8 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 		// Check if the sign bit (48th bit) is set
 		if val48 & 0x800000000000 != 0 {
 			// Extend the sign to 64 bits if the 48th bit is set
-			val48 |= 0xFFFF000000000000
+			// val48 |= uint64(0xFFFF000000000000)
+			val48 |= -1 << 48
 		}
 		return 6, val48;
 	case 6:
@@ -62,17 +64,14 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 }
 
 
-
-func parseRecord(recordRaw []byte) {
-
+//!Record belongs to one row from the table containing all the cols
+func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
 	//!Record is basically each row of the table or index. 
 	totalBytesCountHeader, hSize := binary.Varint(recordRaw);
 
 	var currOffset int64;
 	currOffset = int64(hSize);
-
-	colIndex := 0;
-
+	
 	var colsSerialTypes []int64
 	var colContents []interface{}
 
@@ -85,10 +84,24 @@ func parseRecord(recordRaw []byte) {
 		contentBytesOffset += int64(bytesReadForContent);
 		colsSerialTypes = append(colsSerialTypes, serialType);
 		colContents = append(colContents, contentValue);
-		
 	}
-
+	return colsSerialTypes, colContents
 }
+
+//!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
+//!Also assumption is that there is no overflow
+func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
+	payloadSizeInBytes, sizeBytesRead := binary.Varint(pageBytes[cellOffset : cellOffset + 9]);
+	currOffset := cellOffset + uint16(sizeBytesRead);
+	_, rowIdBytesRead := binary.Varint(pageBytes[currOffset : currOffset + 9]);
+	currOffset += uint16(rowIdBytesRead);
+	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + payloadSizeInBytes];
+
+	//!Parse this record
+	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
+	return cellColsSerialType, cellColsContent
+}
+
 
 //!Since offset on each page are from beginning, so it is better to read the whole page and continue.
 func getCellPointersOnPage(pageBytes []byte, pageSize int64, firstPage bool) []uint16 {
@@ -103,7 +116,7 @@ func getCellPointersOnPage(pageBytes []byte, pageSize int64, firstPage bool) []u
 	
 	//!Get the size of page header, which is first byte after file header (and first byte on page if no page header)
 	var pageHeaderSizeInBytes int64
-	if rawBytes[fileHeaderOffset] == 0x05 || rawBytes[fileHeaderOffset] == 0x02 {	//!Interior table page.
+	if pageBytes[fileHeaderOffset] == 0x05 || pageBytes[fileHeaderOffset] == 0x02 {	//!Interior table page.
 		pageHeaderSizeInBytes = 12
 	}	else {
 		pageHeaderSizeInBytes = 8
@@ -118,27 +131,13 @@ func getCellPointersOnPage(pageBytes []byte, pageSize int64, firstPage bool) []u
 
 	//!Get pointers to all the cells.
 	cellPointers := make([]uint16, cellsCount);
-	for i := 0; i < cellsCount; i++ { 		//!2 bytes is the cell size
+	for i := int64(0); i < cellsCount; i++ { 		//!2 bytes is the cell size
 		cellPointers[i] = binary.BigEndian.Uint16(pageBytes[currOffset + 2 * i : currOffset + 2 * (i + 1)])
     }
-
 	return cellPointers;
 }
 
 
-//!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
-//!Also assumption is that there is no overflow
-func readCell(pageBytes []byte, cellOffset uint16) {
-	payloadSizeInBytes, sizeBytesRead := binary.Varint(pageBytes[cellOffset : cellOffset + 9]);
-	currOffset := cellOffset + uint16(sizeBytesRead);
-	_, rowIdBytesRead := binary.Varint(pageBytes[currOffset : currOffset + 9]);
-	currOffset += uint16(rowIdBytesRead);
-	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + payloadSizeInBytes];
-
-	//!Parse this record
-	parsedRecord := parseRecord(currCellPayloadBytes);
-	return parsedRecord
-}
 
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
@@ -217,12 +216,26 @@ func main() {
 		//!First page will have sql_schema table and need to go through each row having info of the table and extract table name from it.
 		cellPointers := getCellPointersOnPage(pageBytes, int64(pageSize), true);
 
-		var names string[];
+		var names []string;
 
 		// Iterate using range
 		for _, cellPointer := range cellPointers {
-			tableRowContent := readCell(pageBytes, cellPointer);
-			names = append(names, tableRowContent.name);
+			//cellColsSerialType, cellColsContent := readCell(pageBytes, cellPointer);
+			_, cellColsContent := readCell(pageBytes, cellPointer);
+
+			//serialTypeOfCol0 := cellColsSerialType[1];
+			stringInCol0 := cellColsContent[1].(string);
+
+			//serialTypeOfCol1 = cellColsSerialType[2];
+			stringInCol1 := cellColsContent[2].(string);
+			
+
+			//!For debugging
+			fmt.Println("Col0 name: ", stringInCol0);
+			fmt.Println("Col1 name: ", stringInCol1);
+
+			//!Schema table consists of type, name, tbl_name, ... ...
+			names = append(names, stringInCol0);
 		}
 
 		for _, name := range names {
