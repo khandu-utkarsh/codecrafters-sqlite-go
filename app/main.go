@@ -482,7 +482,7 @@ func main() {
 		}
 
 		//!See if it is only asking for count
-		if len(ps.Columns) == 1 && strings.HasPrefix(ps.Columns[0], "COUNT(") {
+		if len(ps.Columns) == 1 && (strings.HasPrefix(ps.Columns[0], "COUNT(") ||  strings.HasPrefix(ps.Columns[0], "count(")){
 			fmt.Println(len(keepRows));
 		} else {
 		//!Extract relevant cols:
@@ -492,7 +492,10 @@ func main() {
 					if(jin != 0) {
 						outString += "|"
 					}
+					//currSerialType := colSerialType[nameToInt[col]];
+					//fmt.Println(currSerialType);
 					colContent := allCols[nameToInt[col]].(string);
+
 					outString += colContent;
 				}
 				fmt.Println(outString);
