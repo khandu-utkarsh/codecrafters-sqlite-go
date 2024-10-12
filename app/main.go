@@ -7,9 +7,39 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
+
+func getRootPageForTable(tableName string, pageBytes []byte) int64 {
+
+	//!First page will have sql_schema table and need to go through each row having info of the table and extract table name from it.
+	cellPointers := getCellPointersOnPage(pageBytes, true);
+
+	var tableRootPage int64;
+
+	// Iterate using range
+	for _, cellPointer := range cellPointers {
+		_, cellColsContent := readCell(pageBytes, cellPointer);
+		//!If the name of the table is equal to the supplied name, extract the root page.
+		//!Schema table consists of type, name, tbl_name, ... ...
+		nameCol := cellColsContent[1].(string);
+		if(nameCol == tableName) {	//!Since it won't be a float or string or blob, hence it will always return int64
+			tableRootPage = cellColsContent[3].(int64);
+			return tableRootPage;
+		}
+	}
+	return -1;
+}
+
+
+func getPageOffset(pageno int64, pageSize int64) int64 {
+	return (pageno - 1) * pageSize;	
+}
+
+
+
 
 //!For using the go inbuild function binary.Varint, we need to send least significant numbers first and then the most significant ones.
 //!But in out case, we have most significant ones first and then least. So here using the custom method.
@@ -114,6 +144,12 @@ func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
 
 	//!Parse this record
 	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
+
+	// //!For debugging
+	// for _, b := range cellColsContent {
+	// 	fmt.Println(b);
+	// }
+
 	return cellColsSerialType, cellColsContent
 }
 
@@ -157,7 +193,15 @@ func getCellPointersOnPage(pageBytes []byte, firstPage bool) []uint16 {
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
 	databaseFilePath := os.Args[1]
-	command := os.Args[2]
+	commandRead := os.Args[2]
+
+	command := commandRead;
+	comPrefix := strings.HasPrefix(command, "SELECT") || strings.HasPrefix(command, "select");
+	if(comPrefix) {
+		command = "SELECT";
+	}
+
+
 
 	switch command {
 	case ".dbinfo":
@@ -245,6 +289,45 @@ func main() {
 			fmt.Println(name);
 		}
 		databaseFile.Close();
+	case "SELECT":		
+		splitted := strings.Split(commandRead, " ");
+		var tableName string;
+		tableName  = splitted[len(splitted) - 1];
+
+		databaseFile, err := os.Open(databaseFilePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		header := make([]byte, 100)
+		_, err = databaseFile.Read(header)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		var pageSize uint16
+		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
+			fmt.Println("Failed to read integer:", err)
+			return
+		}
+
+		pageBytes := make([]byte, int64(pageSize));
+		databaseFile.ReadAt(pageBytes, 0);
+
+		tablePageNo := int64(getRootPageForTable(tableName, pageBytes));
+		tablePageOffset := getPageOffset(tablePageNo, int64(pageSize));
+			
+		tablePageBytes := make([]byte, int64(pageSize));
+		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
+
+		//!All the rows on the page.
+		cellPointers := getCellPointersOnPage(tablePageBytes, false);
+		//!Number of rows would be equal to number of cell pointers:
+		fmt.Println((len(cellPointers)));
+		databaseFile.Close();
+
+
+
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
