@@ -7,24 +7,93 @@ import (
 	"log"
 	"math"
 	"os"
+	"regexp"
 	"strings"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
 
-func parseColNamesFromSQLStr(sql string) []string {
-	indStart := strings.Index(sql, "(");
-	indEnd := strings.Index(sql, ")");
+// ParsedSQL holds the extracted data from the SQL query.
+type ParsedSQLQuery struct {
+	Columns   []string
+	Table     string
+	Condition string
+}
 
-	colsDetails := sql[indStart + 1 : indEnd];
-	splitted := strings.Split(colsDetails, ",");
-	var colNames []string;
-	for _, col := range splitted {
-		col = strings.Trim(col, " ");
-		splittedCol := strings.Split(col, " ");
-		colNames = append(colNames, splittedCol[0]);
+// parseSQL extracts columns, table, and where condition from an SQL query.
+func parseSQL(query string) ParsedSQLQuery {
+	// Use case-insensitive regex patterns.
+	selectRegex := regexp.MustCompile(`(?i)\bSELECT\s+(.+?)\s+\bFROM\b`)
+	fromRegex := regexp.MustCompile(`(?i)\bFROM\s+(\w+)\b`)
+	whereRegex := regexp.MustCompile(`(?i)\bWHERE\s+(.+)`)
+
+	// Match the query against each regex pattern.
+	columnsMatch := selectRegex.FindStringSubmatch(query)
+	tableMatch := fromRegex.FindStringSubmatch(query)
+	whereMatch := whereRegex.FindStringSubmatch(query)
+
+	// Extract and clean the columns.
+	var columns []string
+	if len(columnsMatch) > 1 {
+		columns = strings.Split(columnsMatch[1], ",")
+		for i := range columns {
+			columns[i] = strings.TrimSpace(columns[i])
+		}
 	}
-	return colNames;
+
+	// Extract the table name.
+	table := ""
+	if len(tableMatch) > 1 {
+		table = tableMatch[1]
+	}
+
+	// Extract the WHERE condition.
+	condition := ""
+	if len(whereMatch) > 1 {
+		condition = strings.TrimSpace(whereMatch[1])
+	}
+
+	return ParsedSQLQuery{
+		Columns:   columns,
+		Table:     table,
+		Condition: condition,
+	}
+}
+
+func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string){
+	// Regex to extract table name and columns.
+	re := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(\w+)\s*\(\s*([^;]*)\s*\)`);
+	match := re.FindStringSubmatch(sql)
+	if len(match) < 3 {
+		log.Fatal("Failed to parse the SQL statement.")
+	}
+
+	// Extract table name and columns.
+	tableName := match[1]
+	columnsStr := match[2]
+
+	// Split columns by commas and trim spaces.
+	columns := strings.Split(columnsStr, ",")
+
+	// fmt.Printf("Table Name: %s\n", tableName)
+	// fmt.Println("Columns:")
+
+	// Iterate over columns and print them.
+	var colNames []string
+	var colContentTypes []string	
+	for _, col := range columns {
+		col = strings.TrimSpace(col) // Trim spaces around each column.
+		parts := strings.Fields(col) // Split column name and type.
+
+		if len(parts) >= 2 {
+			columnName := parts[0]
+			dataType := parts[1]
+			colNames = append(colNames, columnName);
+			colContentTypes = append(colContentTypes, dataType);
+		}
+	}
+
+	return tableName, colNames, colContentTypes;
 }
 
 func getRootPageAndCreationStrForTable(tableName string, pageBytes []byte) (int64, string) {
@@ -312,39 +381,11 @@ func main() {
 		}
 		databaseFile.Close();
 	case "SELECT":		
-		splitted := strings.Split(commandRead, " ");
-
-		var selectIndex, fromIndex, whereIndex int;
-		selectIndex = -1;
-		fromIndex = -1;
-		whereIndex = -1;
-		for in, col := range splitted {
-			if(col == "SELECT" || col == "select") {
-				selectIndex = in;
-			} else if(col == "FROM" || col == "from") {
-				fromIndex = in;				
-			} else if(col == "WHERE" || col == "where") {
-				whereIndex = in;
-			}
-		}
-		
-		_ = whereIndex;
-
-		//fmt.Println(selectIndex, fromIndex, whereIndex);
-
-		colNamesRaw := splitted[selectIndex + 1: fromIndex];
-		colNamesInp := make([]string, len(colNamesRaw))
-
-		for i, col := range colNamesRaw {
-			colNamesInp[i] = strings.Trim(col, "")
-			colNamesInp[i] = strings.Trim(col, ",")
-		}
-		// fmt.Println(colNamesInp);
-		//!Testing;
-
-		tableName := splitted[fromIndex + 1];
-		//fmt.Println(tableName)
-		
+	    ps := parseSQL(commandRead);
+		colNamesInp := ps.Columns;
+		tableName := ps.Table;
+		whereCondition := ps.Condition;
+		_ = whereCondition;
 
 		//!Find the root page of the table
 		databaseFile, err := os.Open(databaseFilePath)
@@ -365,7 +406,7 @@ func main() {
 		databaseFile.ReadAt(pageBytes, 0);
 		tablePageNo, sqlStr := getRootPageAndCreationStrForTable(tableName, pageBytes);
 		//fmt.Println(sqlStr); //!For debugging.
-		colNames := parseColNamesFromSQLStr(sqlStr);
+		_, colNames, _ := getTableDetailsFromSQLSchemaTable(sqlStr)
 		//fmt.Println(colNames);
 		var colIndices []int;
 		for _, col := range colNamesInp {
