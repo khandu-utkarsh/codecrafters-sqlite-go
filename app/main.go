@@ -17,14 +17,12 @@ func parseColNamesFromSQLStr(sql string) []string {
 	indEnd := strings.Index(sql, ")");
 
 	colsDetails := sql[indStart + 1 : indEnd];
-	colsDetails = strings.Trim(colsDetails, " ");
 	splitted := strings.Split(colsDetails, ",");
-
 	var colNames []string;
 	for _, col := range splitted {
-		colSp := strings.Split(col, " ");
-		colNameCol := strings.Trim(colSp[0], "\n\t");
-		colNames = append(colNames, colNameCol);
+		col = strings.Trim(col, " ");
+		splittedCol := strings.Split(col, " ");
+		colNames = append(colNames, splittedCol[0]);
 	}
 	return colNames;
 }
@@ -315,49 +313,78 @@ func main() {
 		databaseFile.Close();
 	case "SELECT":		
 		splitted := strings.Split(commandRead, " ");
-		var tableName string;
-		selectQuantity := splitted[1];
-		tableName  = splitted[len(splitted) - 1];
 
+		var selectIndex, fromIndex, whereIndex int;
+		selectIndex = -1;
+		fromIndex = -1;
+		whereIndex = -1;
+		for in, col := range splitted {
+			if(col == "SELECT" || col == "select") {
+				selectIndex = in;
+			} else if(col == "FROM" || col == "from") {
+				fromIndex = in;				
+			} else if(col == "WHERE" || col == "where") {
+				whereIndex = in;
+			}
+		}
+		
+		_ = whereIndex;
+
+		//fmt.Println(selectIndex, fromIndex, whereIndex);
+
+		colNamesRaw := splitted[selectIndex + 1: fromIndex];
+		colNamesInp := make([]string, len(colNamesRaw))
+
+		for i, col := range colNamesRaw {
+			colNamesInp[i] = strings.Trim(col, "")
+			colNamesInp[i] = strings.Trim(col, ",")
+		}
+		// fmt.Println(colNamesInp);
+		//!Testing;
+
+		tableName := splitted[fromIndex + 1];
+		//fmt.Println(tableName)
+		
+
+		//!Find the root page of the table
 		databaseFile, err := os.Open(databaseFilePath)
 		if err != nil {
 			log.Fatal(err)
 		}
-
 		header := make([]byte, 100)
 		_, err = databaseFile.Read(header)
 		if err != nil {
 			log.Fatal(err)
 		}
-
 		var pageSize uint16
 		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return
 		}
-
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
-
 		tablePageNo, sqlStr := getRootPageAndCreationStrForTable(tableName, pageBytes);
 		//fmt.Println(sqlStr); //!For debugging.
 		colNames := parseColNamesFromSQLStr(sqlStr);
-
-		var colIndex int;
-		colIndex = -1;
-		for iCol, col := range colNames {
-			if(col == selectQuantity) {
-				colIndex = iCol;
-				break;
+		//fmt.Println(colNames);
+		var colIndices []int;
+		for _, col := range colNamesInp {
+			for colIndex, colNameCreation := range colNames {
+				if(colNameCreation == col) {
+					colIndices = append(colIndices, colIndex);
+					break;
+				}
 			}
 		}
 
+		//fmt.Println(colIndices);
+
 		giveRowsCount := false;
-		if(colIndex == -1) {
+		if(len(colIndices) == 0) {
 			giveRowsCount = true;
 		}
 
-
+		//!Now going to the table page, and interpretting values:
 		tablePageOffset := getPageOffset(tablePageNo, int64(pageSize));
 		tablePageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
@@ -368,36 +395,38 @@ func main() {
 			fmt.Println((len(cellPointers)));
 		} else {		
 			//!Iterating over each roww (record)
-
-			var decodeInto int64;
-			var colRows []interface {};
 			for _, cellPointer := range cellPointers {
-				colSerialTypes, cellColsContent := readCell(tablePageBytes, cellPointer);
-
-				reqColSerialType := colSerialTypes[colIndex];
-				decodeInto = reqColSerialType;
-				reqColContent :=  cellColsContent[colIndex];
-				colRows = append(colRows, reqColContent);
-			}
-			for _, row := range colRows {
-				if (decodeInto == 7) {
-					curr := row.(float64);
-					fmt.Println(curr);
-					//!Req content is float
-				} else if(decodeInto%2 == 0 && decodeInto >= 12) {
-					curr := row.([]byte)
-					fmt.Println(curr);
-				} else if(decodeInto%2 != 0 && decodeInto > 13) {
-					//!String	
-					curr := row.(string);
-					fmt.Println(curr);
-					} else {
-					//!Int 64	
-					curr := row.(int64);
-					fmt.Println(curr);
+				//colSerialTypes, cellColsContent := readCell(tablePageBytes, cellPointer);
+				_, cellColsContent := readCell(tablePageBytes, cellPointer);
+				var outString string;
+				for i, colIndex := range colIndices {
+					if(i != 0) {
+						outString += "|";
+					}
+					//reqColSerialType := colSerialTypes[colIndex];
+					//decodeInto = reqColSerialType;
+					reqColContent :=  (cellColsContent[colIndex]).(string);
+					outString += reqColContent;
+					//!Asumming everything to be string for simplicity
+					// if (decodeInto == 7) {
+					// 	curr := row.(float64);
+					// 	fmt.Println(curr);
+					// 	//!Req content is float
+					// } else if(decodeInto%2 == 0 && decodeInto >= 12) {
+					// 	curr := row.([]byte)
+					// 	fmt.Println(curr);
+					// } else if(decodeInto%2 != 0 && decodeInto > 13) {
+					// 	//!String	
+					// 	curr := row.(string);
+					// 	fmt.Println(curr);
+					// 	} else {
+					// 	//!Int 64	
+					// 	curr := row.(int64);
+					// 	fmt.Println(curr);
+					// }
 				}
+				fmt.Println(outString);
 			}
-
 		}
 		databaseFile.Close();
 	default:
