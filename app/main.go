@@ -129,8 +129,41 @@ func getPageOffset(pageno int64, pageSize int64) int64 {
 	return (pageno - 1) * pageSize;	
 }
 
+//!Not to be used with the schema table
+func gerRecordsFomTablePage(tablePageBytes []byte) ([]int64, [][]interface{}) {
 
+	//	!All the rows on the page.
+	cellPointers := getCellPointersOnPage(tablePageBytes, false);
+	//!cellPointers point to each row:
+	//!Iterating over each roww (record)
 
+	var colRows [][]interface{};
+	var colSerial []int64;
+	for _, cellPointer := range cellPointers {
+		colSerialTypes, cellColsContent := readCell(tablePageBytes, cellPointer);
+		colRows = append(colRows, cellColsContent);
+		colSerial = colSerialTypes	//!Would be and should be same for every row.
+	}
+	return colSerial, colRows;
+	//!Decode pattern below:
+		//!Asumming everything to be string for simplicity
+		// if (decodeInto == 7) {
+		// 	curr := row.(float64);
+		// 	fmt.Println(curr);
+		// 	//!Req content is float
+		// } else if(decodeInto%2 == 0 && decodeInto >= 12) {
+		// 	curr := row.([]byte)
+		// 	fmt.Println(curr);
+		// } else if(decodeInto%2 != 0 && decodeInto > 13) {
+		// 	//!String	
+		// 	curr := row.(string);
+		// 	fmt.Println(curr);
+		// 	} else {
+		// 	//!Int 64	
+		// 	curr := row.(int64);
+		// 	fmt.Println(curr);
+		// }
+}
 
 //!For using the go inbuild function binary.Varint, we need to send least significant numbers first and then the most significant ones.
 //!But in out case, we have most significant ones first and then least. So here using the custom method.
@@ -235,12 +268,6 @@ func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
 
 	//!Parse this record
 	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
-
-	// //!For debugging
-	// for _, b := range cellColsContent {
-	// 	fmt.Println(b);
-	// }
-
 	return cellColsSerialType, cellColsContent
 }
 
@@ -296,6 +323,9 @@ func main() {
 
 	switch command {
 	case ".dbinfo":
+		//!Get databse page size and get the number of tables in database
+
+
 		databaseFile, err := os.Open(databaseFilePath)
 		if err != nil {
 			log.Fatal(err)
@@ -370,7 +400,6 @@ func main() {
 
 		// Iterate using range
 		for _, cellPointer := range cellPointers {
-			//cellColsSerialType, cellColsContent := readCell(pageBytes, cellPointer);
 			_, cellColsContent := readCell(pageBytes, cellPointer);
 			//!Schema table consists of type, name, tbl_name, ... ...
 			nameCol := cellColsContent[1].(string);
@@ -381,13 +410,17 @@ func main() {
 		}
 		databaseFile.Close();
 	case "SELECT":		
+
+		//!Processing the input query
 	    ps := parseSQL(commandRead);
-		colNamesInp := ps.Columns;
+		// colNamesInp := ps.Columns;
+		// fmt.Println(colNamesInp);
 		tableName := ps.Table;
+		_ = tableName
 		whereCondition := ps.Condition;
 		_ = whereCondition;
 
-		//!Find the root page of the table
+		//!Interpet sql_schema table to get table details:
 		databaseFile, err := os.Open(databaseFilePath)
 		if err != nil {
 			log.Fatal(err)
@@ -402,73 +435,70 @@ func main() {
 			fmt.Println("Failed to read integer:", err)
 			return
 		}
+
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
 		tablePageNo, sqlStr := getRootPageAndCreationStrForTable(tableName, pageBytes);
-		//fmt.Println(sqlStr); //!For debugging.
 		_, colNames, _ := getTableDetailsFromSQLSchemaTable(sqlStr)
-		//fmt.Println(colNames);
-		var colIndices []int;
-		for _, col := range colNamesInp {
-			for colIndex, colNameCreation := range colNames {
-				if(colNameCreation == col) {
-					colIndices = append(colIndices, colIndex);
-					break;
-				}
-			}
+
+		//!Mapping table colummn names to index
+		nameToInt := make(map[string]int)
+		for i, cn := range colNames {
+			nameToInt[cn] = i;
 		}
 
-		//fmt.Println(colIndices);
-
-		giveRowsCount := false;
-		if(len(colIndices) == 0) {
-			giveRowsCount = true;
-		}
-
+		//!Go to page of the asked table and fetch information of all the records.
 		//!Now going to the table page, and interpretting values:
 		tablePageOffset := getPageOffset(tablePageNo, int64(pageSize));
 		tablePageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
 
-		//!All the rows on the page.
-		cellPointers := getCellPointersOnPage(tablePageBytes, false);		
-		if(giveRowsCount) {
-			fmt.Println((len(cellPointers)));
-		} else {		
-			//!Iterating over each roww (record)
-			for _, cellPointer := range cellPointers {
-				//colSerialTypes, cellColsContent := readCell(tablePageBytes, cellPointer);
-				_, cellColsContent := readCell(tablePageBytes, cellPointer);
+		//!Assuming simple conditions for where without AND and other things.
+		var ccns []string;
+		if(ps.Condition != "") {
+			colAndCond := strings.Split(ps.Condition, "=");
+
+			for _, cc := range colAndCond {
+				cc = strings.Fields(cc)[0];
+				cc = strings.Trim(cc, "'")
+				ccns = append(ccns, cc);
+			}	
+		}
+
+		colSerialType, colRows := gerRecordsFomTablePage(tablePageBytes);
+		_ = colSerialType;	//!Assuming every value to be string. For simplicity
+		var keepRows [][]interface{};
+		for _, allCols := range colRows {
+			if(len(ccns) != 0) {
+				//temp := allCols[nameToInt[ccns[0]]].(string);
+				//fmt.Println("temp: ", temp);
+				if allCols[nameToInt[ccns[0]]].(string) == ccns[1]	{
+					//!I am assuming everything to be string here. Which it might not be
+					keepRows = append(keepRows, allCols);
+				}
+			} else {
+				keepRows = append(keepRows, allCols);				
+			}
+		}
+
+		//!See if it is only asking for count
+		if len(ps.Columns) == 1 && strings.HasPrefix(ps.Columns[0], "COUNT(") {
+			fmt.Println(len(keepRows));
+		} else {
+		//!Extract relevant cols:
+			for _, allCols := range keepRows {
 				var outString string;
-				for i, colIndex := range colIndices {
-					if(i != 0) {
-						outString += "|";
+				for jin, col := range ps.Columns {
+					if(jin != 0) {
+						outString += "|"
 					}
-					//reqColSerialType := colSerialTypes[colIndex];
-					//decodeInto = reqColSerialType;
-					reqColContent :=  (cellColsContent[colIndex]).(string);
-					outString += reqColContent;
-					//!Asumming everything to be string for simplicity
-					// if (decodeInto == 7) {
-					// 	curr := row.(float64);
-					// 	fmt.Println(curr);
-					// 	//!Req content is float
-					// } else if(decodeInto%2 == 0 && decodeInto >= 12) {
-					// 	curr := row.([]byte)
-					// 	fmt.Println(curr);
-					// } else if(decodeInto%2 != 0 && decodeInto > 13) {
-					// 	//!String	
-					// 	curr := row.(string);
-					// 	fmt.Println(curr);
-					// 	} else {
-					// 	//!Int 64	
-					// 	curr := row.(int64);
-					// 	fmt.Println(curr);
-					// }
+					colContent := allCols[nameToInt[col]].(string);
+					outString += colContent;
 				}
 				fmt.Println(outString);
 			}
 		}
+
 		databaseFile.Close();
 	default:
 		fmt.Println("Unknown command", command)
