@@ -11,6 +11,21 @@ import (
 	// "github.com/xwb1989/sqlparser"
 )
 
+//!For using the go inbuild function binary.Varint, we need to send least significant numbers first and then the most significant ones.
+//!But in out case, we have most significant ones first and then least. So here using the custom method.
+
+//!Not taking care of negative value. In the documentation it is given that take care of negative values as well.
+func ReadVarint(buf []byte) (uint64, int) {
+	var x uint64
+	for i, b := range buf {
+		x = (x << 7) | uint64(b & 0x7F)
+		if b & 0x80 == 0 {
+			return x, i + 1
+		}
+	}
+	return 0, 0
+}
+
 func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {	
 	switch serialType {
 	case 0:
@@ -24,8 +39,7 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 	case 3:
 		value32:= int32(raw[0]) << 16 | int32(raw[1]) << 8 | int32(raw[2]);
 		if value32 & 0x800000 != 0 {
-			value32 |= -1 << 24
-			// value32 |= 0xFF000000
+			value32 |= -1 << 24	//!Since it is a 2 compliments integer, taking care of negative values.
 		}
 		return 3, int64(value32);
 	case 4:
@@ -36,8 +50,6 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 
 		// Check if the sign bit (48th bit) is set
 		if val48 & 0x800000000000 != 0 {
-			// Extend the sign to 64 bits if the 48th bit is set
-			// val48 |= uint64(0xFFFF000000000000)
 			val48 |= -1 << 48
 		}
 		return 6, val48;
@@ -57,17 +69,17 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 			return serialBytesCount, raw[0:serialBytesCount];
 		} else if serialType%2 != 0 && serialType > 13 {
 			serialBytesCount := (serialType - 13) / 2
-			return serialBytesCount, string(raw[0:serialBytesCount]);
+			localString := string(raw[0:serialBytesCount])
+			return serialBytesCount, localString;
 		}
 	}
-	return -1, nil // Add a return statement in case none of the cases match
+	return -1, nil // Adding a return statement in case none of the cases match
 }
-
 
 //!Record belongs to one row from the table containing all the cols
 func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
-	//!Record is basically each row of the table or index. 
-	totalBytesCountHeader, hSize := binary.Varint(recordRaw);
+	//!Record is basically each row of the table or index.
+	totalBytesCountHeader, hSize := ReadVarint(recordRaw);
 
 	var currOffset int64;
 	currOffset = int64(hSize);
@@ -75,10 +87,11 @@ func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
 	var colsSerialTypes []int64
 	var colContents []interface{}
 
-	contentBytesOffset := totalBytesCountHeader;
+	contentBytesOffset := int64(totalBytesCountHeader);
 
-	for currOffset < totalBytesCountHeader {
-		serialType, bytesRead := binary.Varint(recordRaw[currOffset : ]);
+	for currOffset < int64(totalBytesCountHeader) {
+		serialTypeU, bytesRead := ReadVarint(recordRaw[currOffset : totalBytesCountHeader]);
+		serialType := int64(serialTypeU);
 		bytesReadForContent, contentValue := interpretBytes(serialType, recordRaw[contentBytesOffset:])	
 		currOffset += int64(bytesRead);
 		contentBytesOffset += int64(bytesReadForContent);
@@ -90,12 +103,14 @@ func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
 
 //!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
 //!Also assumption is that there is no overflow
+//!Does go pass value by reference or by value. Look into it.
 func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
-	payloadSizeInBytes, sizeBytesRead := binary.Varint(pageBytes[cellOffset : cellOffset + 9]);
+	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
 	currOffset := cellOffset + uint16(sizeBytesRead);
-	_, rowIdBytesRead := binary.Varint(pageBytes[currOffset : currOffset + 9]);
+	_, rowIdBytesRead := ReadVarint(pageBytes[currOffset : currOffset + 9]);
+
 	currOffset += uint16(rowIdBytesRead);
-	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + payloadSizeInBytes];
+	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
 
 	//!Parse this record
 	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
@@ -104,7 +119,7 @@ func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
 
 
 //!Since offset on each page are from beginning, so it is better to read the whole page and continue.
-func getCellPointersOnPage(pageBytes []byte, pageSize int64, firstPage bool) []uint16 {
+func getCellPointersOnPage(pageBytes []byte, firstPage bool) []uint16 {
 	//!If first page, there will be file header, else page won't have file header, it will directly have page header
 	//!If it is the first page, page size will be 100 bytes less which has removed the header.
 
@@ -127,7 +142,7 @@ func getCellPointersOnPage(pageBytes []byte, pageSize int64, firstPage bool) []u
 	//!Cells count on page
 	cellsCount := int64(binary.BigEndian.Uint16(pageBytes[currOffset + 3 : currOffset + 5]))
 
-	currOffset += currOffset + pageHeaderSizeInBytes;
+	currOffset += pageHeaderSizeInBytes;
 
 	//!Get pointers to all the cells.
 	cellPointers := make([]uint16, cellsCount);
@@ -214,7 +229,7 @@ func main() {
 		databaseFile.ReadAt(pageBytes, 0);
 
 		//!First page will have sql_schema table and need to go through each row having info of the table and extract table name from it.
-		cellPointers := getCellPointersOnPage(pageBytes, int64(pageSize), true);
+		cellPointers := getCellPointersOnPage(pageBytes, true);
 
 		var names []string;
 
@@ -222,31 +237,14 @@ func main() {
 		for _, cellPointer := range cellPointers {
 			//cellColsSerialType, cellColsContent := readCell(pageBytes, cellPointer);
 			_, cellColsContent := readCell(pageBytes, cellPointer);
-
-			//serialTypeOfCol0 := cellColsSerialType[1];
-			stringInCol0 := cellColsContent[1].(string);
-
-			//serialTypeOfCol1 = cellColsSerialType[2];
-			stringInCol1 := cellColsContent[2].(string);
-			
-
-			//!For debugging
-			fmt.Println("Col0 name: ", stringInCol0);
-			fmt.Println("Col1 name: ", stringInCol1);
-
 			//!Schema table consists of type, name, tbl_name, ... ...
-			names = append(names, stringInCol0);
+			nameCol := cellColsContent[1].(string);
+			names = append(names, nameCol);
 		}
-
 		for _, name := range names {
 			fmt.Println(name);
 		}
-
-
 		databaseFile.Close();
-
-
-
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
