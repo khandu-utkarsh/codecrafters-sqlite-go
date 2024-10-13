@@ -96,73 +96,8 @@ func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string){
 	return tableName, colNames, colContentTypes;
 }
 
-func getRootPageAndCreationStrForTable(tableName string, pageBytes []byte) (int64, string) {
-	//!First page will have sql_schema table and need to go through each row having info of the table and extract table name from it.
-	cellPointers := getCellPointersOnPage(pageBytes, true);
-
-	var tableRootPage int64;
-
-	pageFound := false;
-	var cellColsContent []interface{};
-	var sqlStr string;
-	// Iterate using range
-	for _, cellPointer := range cellPointers {
-		_, cellColsContent = readCell(pageBytes, cellPointer);
-		//!If the name of the table is equal to the supplied name, extract the root page.
-		//!Schema table consists of type, name, tbl_name, ... ...
-		nameCol := cellColsContent[1].(string);
-		if(nameCol == tableName) {	//!Since it won't be a float or string or blob, hence it will always return int64
-			tableRootPage = cellColsContent[3].(int64);
-			sqlStr = cellColsContent[4].(string);
-			pageFound = true;		
-			break;
-		}
-	}
-	if(!pageFound) {
-		return int64(-1), sqlStr;
-	}
-	return tableRootPage, sqlStr;
-}
-
-
 func getPageOffset(pageno int64, pageSize int64) int64 {
 	return (pageno - 1) * pageSize;	
-}
-
-//!Not to be used with the schema table
-func gerRecordsFomTablePage(tablePageBytes []byte) ([]int64, [][]interface{}) {
-
-	//	!All the rows on the page.
-	cellPointers := getCellPointersOnPage(tablePageBytes, false);
-	//!cellPointers point to each row:
-	//!Iterating over each roww (record)
-
-	var colRows [][]interface{};
-	var colSerial []int64;
-	for _, cellPointer := range cellPointers {
-		colSerialTypes, cellColsContent := readCell(tablePageBytes, cellPointer);
-		colRows = append(colRows, cellColsContent);
-		colSerial = colSerialTypes	//!Would be and should be same for every row.
-	}
-	return colSerial, colRows;
-	//!Decode pattern below:
-		//!Asumming everything to be string for simplicity
-		// if (decodeInto == 7) {
-		// 	curr := row.(float64);
-		// 	fmt.Println(curr);
-		// 	//!Req content is float
-		// } else if(decodeInto%2 == 0 && decodeInto >= 12) {
-		// 	curr := row.([]byte)
-		// 	fmt.Println(curr);
-		// } else if(decodeInto%2 != 0 && decodeInto > 13) {
-		// 	//!String	
-		// 	curr := row.(string);
-		// 	fmt.Println(curr);
-		// 	} else {
-		// 	//!Int 64	
-		// 	curr := row.(int64);
-		// 	fmt.Println(curr);
-		// }
 }
 
 //!For using the go inbuild function binary.Varint, we need to send least significant numbers first and then the most significant ones.
@@ -255,10 +190,11 @@ func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
 	return colsSerialTypes, colContents
 }
 
+
 //!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
 //!Also assumption is that there is no overflow
 //!Does go pass value by reference or by value. Look into it.
-func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
+func readTableLeafCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
 	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
 	currOffset := cellOffset + uint16(sizeBytesRead);
 	_, rowIdBytesRead := ReadVarint(pageBytes[currOffset : currOffset + 9]);
@@ -271,42 +207,72 @@ func readCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
 	return cellColsSerialType, cellColsContent
 }
 
-
-//!Since offset on each page are from beginning, so it is better to read the whole page and continue.
-func getCellPointersOnPage(pageBytes []byte, firstPage bool) []uint16 {
-	//!If first page, there will be file header, else page won't have file header, it will directly have page header
-	//!If it is the first page, page size will be 100 bytes less which has removed the header.
-
+//!Never call this on first page:
+func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageBytes []byte ) ([]int64, [][]interface{}) {
+	//!Skip the fileHeader in case of page one.
 	var fileHeaderOffset int64
 	fileHeaderOffset = 0;
 	if(firstPage) {
 		fileHeaderOffset = 100;
 	}
-	
-	//!Get the size of page header, which is first byte after file header (and first byte on page if no page header)
-	var pageHeaderSizeInBytes int64
-	if pageBytes[fileHeaderOffset] == 0x05 || pageBytes[fileHeaderOffset] == 0x02 {	//!Interior table page.
-		pageHeaderSizeInBytes = 12
-	}	else {
-		pageHeaderSizeInBytes = 8
+	currOffset := fileHeaderOffset;
+	pageHeaderType := currPageBytes[currOffset]
+	cellsCount := int64(binary.BigEndian.Uint16(currPageBytes[currOffset + 3 : currOffset + 5]))
+
+	var rightmostChildPageNo int64;
+	var pageHeaderSizeInBytes int64;
+
+	if pageHeaderType == 0x05 {
+		pageHeaderSizeInBytes = int64(12)
+		rightmostChildPageNo = int64(binary.BigEndian.Uint32(currPageBytes[currOffset + 8: currOffset + 12])) 
+
+	} else if pageHeaderType == 0x0d {
+		pageHeaderSizeInBytes = int64(8)	
+	} else {
+		fmt.Println("Error, not correct type");
 	}
 
-	currOffset := fileHeaderOffset;
-
-	//!Cells count on page
-	cellsCount := int64(binary.BigEndian.Uint16(pageBytes[currOffset + 3 : currOffset + 5]))
-
 	currOffset += pageHeaderSizeInBytes;
-
 	//!Get pointers to all the cells.
 	cellPointers := make([]uint16, cellsCount);
 	for i := int64(0); i < cellsCount; i++ { 		//!2 bytes is the cell size
-		cellPointers[i] = binary.BigEndian.Uint16(pageBytes[currOffset + 2 * i : currOffset + 2 * (i + 1)])
-    }
-	return cellPointers;
+		cellPointers[i] = binary.BigEndian.Uint16(currPageBytes[currOffset + 2 * i : currOffset + 2 * (i + 1)])
+	}
+
+	//!If leaf, directly fetch the content and return, if not recurse.
+	if(pageHeaderType == 0x0d) {
+		var colRows [][]interface{};
+		var colSerial []int64;
+		for _, cellPointer := range cellPointers {
+			colSerialTypes, cellColsContent := readTableLeafCell(currPageBytes, cellPointer);
+			colRows = append(colRows, cellColsContent);
+			colSerial = colSerialTypes	//!Would be and should be same for every row.
+		}
+		return colSerial, colRows;
+	}
+
+	//!Interior thing, get page no of children
+	childrenPageNos := make([]int64, cellsCount + 1);		
+	for i, cellPointer := range cellPointers {
+		pagePtrBytes := currPageBytes[cellPointer: cellPointer + 4];
+		childrenPageNos[i] = int64(binary.BigEndian.Uint32(pagePtrBytes));
+		//_, rowIdBytesRead := ReadVarint(currPageBytes[cellPointer + 4 : cellPointer + 4 + 9]);	//!Not needed rn!!
+	} 	
+	childrenPageNos[cellsCount + 1] = rightmostChildPageNo;
+
+	var colRows [][]interface{};
+	var colSerial []int64;
+	for _, childPageNo := range childrenPageNos {
+		tablePageOffset := getPageOffset(childPageNo, pageSize);
+		tablePageBytes := make([]byte, int64(pageSize));
+		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
+		serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, firstPage, tablePageBytes);
+		colRows = append(colRows, rowsContaingCols...)
+		colSerial = serialTypes;	//!Assuming they are all same.
+
+	}
+	return colSerial, colRows;
 }
-
-
 
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
@@ -393,18 +359,16 @@ func main() {
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
 
-		//!First page will have sql_schema table and need to go through each row having info of the table and extract table name from it.
-		cellPointers := getCellPointersOnPage(pageBytes, true);
-
+		//!Never call this on first page:
+		_, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes)
+	
 		var names []string;
-
-		// Iterate using range
-		for _, cellPointer := range cellPointers {
-			_, cellColsContent := readCell(pageBytes, cellPointer);
+		for _, row := range rowsContainingCols {
 			//!Schema table consists of type, name, tbl_name, ... ...
-			nameCol := cellColsContent[1].(string);
+			nameCol := row[1].(string);
 			names = append(names, nameCol);
 		}
+
 		for _, name := range names {
 			fmt.Println(name);
 		}
@@ -413,10 +377,8 @@ func main() {
 
 		//!Processing the input query
 	    ps := parseSQL(commandRead);
-		// colNamesInp := ps.Columns;
-		// fmt.Println(colNamesInp);
-		tableName := ps.Table;
-		_ = tableName
+
+		Q_tableName := ps.Table;
 		whereCondition := ps.Condition;
 		_ = whereCondition;
 
@@ -435,10 +397,30 @@ func main() {
 			fmt.Println("Failed to read integer:", err)
 			return
 		}
-
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
-		tablePageNo, sqlStr := getRootPageAndCreationStrForTable(tableName, pageBytes);
+
+		//!Reading and interpretting sql schema table
+		_, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes);
+
+		var qTablePageNo int64;
+		var sqlStr string;
+		pageFound := false;	
+
+		for _, row := range rowsContainingCols {
+			//!Schema table consists of type, name, tbl_name, ... ...
+			nameCol := row[1].(string);
+			if(nameCol == Q_tableName) {
+				qTablePageNo = row[3].(int64);
+				sqlStr = row[4].(string);
+				pageFound = true;		
+				break;
+			}
+		}
+		if(!pageFound) {
+			fmt.Println("Error, table not found");
+		}
+
 		_, colNames, _ := getTableDetailsFromSQLSchemaTable(sqlStr)
 
 		//!Mapping table colummn names to index
@@ -449,10 +431,10 @@ func main() {
 
 		//!Go to page of the asked table and fetch information of all the records.
 		//!Now going to the table page, and interpretting values:
-		tablePageOffset := getPageOffset(tablePageNo, int64(pageSize));
+		tablePageOffset := getPageOffset(qTablePageNo, int64(pageSize));
 		tablePageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
-
+		
 		//!Assuming simple conditions for where without AND and other things.
 		var ccns []string;
 		if(ps.Condition != "") {
@@ -465,10 +447,15 @@ func main() {
 			}	
 		}
 
-		colSerialType, colRows := gerRecordsFomTablePage(tablePageBytes);
-		_ = colSerialType;	//!Assuming every value to be string. For simplicity
+		firstPage := false;
+		if(qTablePageNo == 1) {
+			firstPage = true;
+		}
+
+		//!Reading and interpretting sql schema table
+		_, qTableRows := readTable(databaseFile, int64(pageSize) , firstPage, tablePageBytes);	//!Assuming everything to be string for simplicity
 		var keepRows [][]interface{};
-		for _, allCols := range colRows {
+		for _, allCols := range qTableRows {
 			if(len(ccns) != 0) {
 				//temp := allCols[nameToInt[ccns[0]]].(string);
 				//fmt.Println("temp: ", temp);
