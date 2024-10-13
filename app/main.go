@@ -60,41 +60,111 @@ func parseSQL(query string) ParsedSQLQuery {
 	}
 }
 
-func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string){
-	// Regex to extract table name and columns.
-	re := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(\w+)\s*\(\s*([^;]*)\s*\)`);
+// func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string){
+// 	// Regex to extract table name and columns.
+// 	re := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(\w+)\s*\(\s*([^;]*)\s*\)`);
+// 	match := re.FindStringSubmatch(sql)
+// 	if len(match) < 3 {
+// 		log.Fatal("Failed to parse the SQL statement.")
+// 	}
+
+// 	// Extract table name and columns.
+// 	tableName := match[1]
+// 	columnsStr := match[2]
+
+// 	// Split columns by commas and trim spaces.
+// 	columns := strings.Split(columnsStr, ",")
+
+// 	// fmt.Printf("Table Name: %s\n", tableName)
+// 	// fmt.Println("Columns:")
+
+// 	// Iterate over columns and print them.
+// 	var colNames []string
+// 	var colContentTypes []string	
+// 	for _, col := range columns {
+// 		col = strings.TrimSpace(col) // Trim spaces around each column.
+// 		parts := strings.Fields(col) // Split column name and type.
+
+// 		if len(parts) >= 2 {
+// 			columnName := parts[0]
+// 			dataType := parts[1]
+// 			colNames = append(colNames, columnName);
+// 			colContentTypes = append(colContentTypes, dataType);
+// 		}
+// 	}
+
+// 	return tableName, colNames, colContentTypes;
+// }
+
+
+// Function to extract table details from a SQL schema string.
+func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string) {
+	// Updated regex to handle escaped table names and complex column definitions.
+	re := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+"?(\w+)"?\s*\(([^)]+)\)`)
 	match := re.FindStringSubmatch(sql)
 	if len(match) < 3 {
 		log.Fatal("Failed to parse the SQL statement.")
 	}
 
-	// Extract table name and columns.
+	// Extract table name and columns string.
 	tableName := match[1]
 	columnsStr := match[2]
 
-	// Split columns by commas and trim spaces.
-	columns := strings.Split(columnsStr, ",")
+	// Split columns by commas but handle cases where commas appear inside column definitions.
+	columns := splitColumnsByComma(columnsStr)
 
-	// fmt.Printf("Table Name: %s\n", tableName)
-	// fmt.Println("Columns:")
-
-	// Iterate over columns and print them.
 	var colNames []string
-	var colContentTypes []string	
+	var colContentTypes []string
+
+	// Iterate over columns to extract column names and types.
 	for _, col := range columns {
-		col = strings.TrimSpace(col) // Trim spaces around each column.
-		parts := strings.Fields(col) // Split column name and type.
+		col = strings.TrimSpace(col) // Trim spaces around the column.
+		parts := strings.Fields(col) // Split by spaces into name, type, and constraints.
 
 		if len(parts) >= 2 {
-			columnName := parts[0]
-			dataType := parts[1]
-			colNames = append(colNames, columnName);
-			colContentTypes = append(colContentTypes, dataType);
+			columnName := parts[0] // First part is the column name.
+			dataType := parts[1]   // Second part is the data type.
+
+			// Collect column names and data types.
+			colNames = append(colNames, columnName)
+			colContentTypes = append(colContentTypes, dataType)
 		}
 	}
 
-	return tableName, colNames, colContentTypes;
+	return tableName, colNames, colContentTypes
 }
+
+// Helper function to split columns while handling commas inside definitions.
+func splitColumnsByComma(columnsStr string) []string {
+	var columns []string
+	var currentColumn strings.Builder
+	inQuotes := false
+
+	for _, char := range columnsStr {
+		switch char {
+		case ',':
+			if inQuotes {
+				currentColumn.WriteRune(char) // Keep comma if inside quotes.
+			} else {
+				columns = append(columns, currentColumn.String())
+				currentColumn.Reset()
+			}
+		case '"':
+			inQuotes = !inQuotes // Toggle the inQuotes flag.
+			currentColumn.WriteRune(char)
+		default:
+			currentColumn.WriteRune(char)
+		}
+	}
+
+	// Add the last column if there's any leftover.
+	if currentColumn.Len() > 0 {
+		columns = append(columns, currentColumn.String())
+	}
+
+	return columns
+}
+
 
 func getPageOffset(pageno int64, pageSize int64) int64 {
 	return (pageno - 1) * pageSize;	
@@ -258,7 +328,7 @@ func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageB
 		childrenPageNos[i] = int64(binary.BigEndian.Uint32(pagePtrBytes));
 		//_, rowIdBytesRead := ReadVarint(currPageBytes[cellPointer + 4 : cellPointer + 4 + 9]);	//!Not needed rn!!
 	} 	
-	childrenPageNos[cellsCount + 1] = rightmostChildPageNo;
+	childrenPageNos[cellsCount] = rightmostChildPageNo;
 
 	var colRows [][]interface{};
 	var colSerial []int64;
@@ -457,9 +527,16 @@ func main() {
 		var keepRows [][]interface{};
 		for _, allCols := range qTableRows {
 			if(len(ccns) != 0) {
-				//temp := allCols[nameToInt[ccns[0]]].(string);
+				var colDetail string;
+				switch v := allCols[nameToInt[ccns[0]]].(type) {
+				case string:
+					colDetail = v;
+				default:
+					continue;
+				}
+				
 				//fmt.Println("temp: ", temp);
-				if allCols[nameToInt[ccns[0]]].(string) == ccns[1]	{
+				if colDetail == ccns[1]	{
 					//!I am assuming everything to be string here. Which it might not be
 					keepRows = append(keepRows, allCols);
 				}
