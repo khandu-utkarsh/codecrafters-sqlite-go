@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
@@ -98,7 +99,7 @@ func parseSQL(query string) ParsedSQLQuery {
 
 
 // Function to extract table details from a SQL schema string.
-func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string) {
+func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string, string) {
 	// Updated regex to handle escaped table names and complex column definitions.
 	re := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+"?(\w+)"?\s*\(([^)]+)\)`)
 	match := re.FindStringSubmatch(sql)
@@ -116,6 +117,8 @@ func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string) 
 	var colNames []string
 	var colContentTypes []string
 
+	var autoincrementedKey string;
+
 	// Iterate over columns to extract column names and types.
 	for _, col := range columns {
 		col = strings.TrimSpace(col) // Trim spaces around the column.
@@ -129,9 +132,16 @@ func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string) 
 			colNames = append(colNames, columnName)
 			colContentTypes = append(colContentTypes, dataType)
 		}
+
+		for _, part := range parts {
+			if(part == "autoincrement") {
+				autoincrementedKey = parts[0];
+				break;
+			}
+		}
 	}
 
-	return tableName, colNames, colContentTypes
+	return tableName, colNames, colContentTypes, autoincrementedKey
 }
 
 // Helper function to split columns while handling commas inside definitions.
@@ -264,21 +274,21 @@ func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
 //!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
 //!Also assumption is that there is no overflow
 //!Does go pass value by reference or by value. Look into it.
-func readTableLeafCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
+func readTableLeafCell(pageBytes []byte, cellOffset uint16) (int64, []int64, []interface{}) {
 	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
 	currOffset := cellOffset + uint16(sizeBytesRead);
-	_, rowIdBytesRead := ReadVarint(pageBytes[currOffset : currOffset + 9]);
+	id, rowIdBytesRead := ReadVarint(pageBytes[currOffset : currOffset + 9]);
 
 	currOffset += uint16(rowIdBytesRead);
 	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
 
 	//!Parse this record
 	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
-	return cellColsSerialType, cellColsContent
+	return int64(id), cellColsSerialType, cellColsContent
 }
 
 //!Never call this on first page:
-func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageBytes []byte ) ([]int64, [][]interface{}) {
+func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageBytes []byte) ([]int64, []int64, [][]interface{}) {
 	//!Skip the fileHeader in case of page one.
 	var fileHeaderOffset int64
 	fileHeaderOffset = 0;
@@ -313,12 +323,14 @@ func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageB
 	if(pageHeaderType == 0x0d) {
 		var colRows [][]interface{};
 		var colSerial []int64;
+		var ids []int64;
 		for _, cellPointer := range cellPointers {
-			colSerialTypes, cellColsContent := readTableLeafCell(currPageBytes, cellPointer);
+			id, colSerialTypes, cellColsContent := readTableLeafCell(currPageBytes, cellPointer);
 			colRows = append(colRows, cellColsContent);
 			colSerial = colSerialTypes	//!Would be and should be same for every row.
+			ids = append(ids, id);
 		}
-		return colSerial, colRows;
+		return ids, colSerial, colRows;
 	}
 
 	//!Interior thing, get page no of children
@@ -332,16 +344,17 @@ func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageB
 
 	var colRows [][]interface{};
 	var colSerial []int64;
+	var rids []int64;
 	for _, childPageNo := range childrenPageNos {
 		tablePageOffset := getPageOffset(childPageNo, pageSize);
 		tablePageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
-		serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, firstPage, tablePageBytes);
+		ids, serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, firstPage, tablePageBytes);
 		colRows = append(colRows, rowsContaingCols...)
 		colSerial = serialTypes;	//!Assuming they are all same.
-
+		rids = append(rids, ids...)
 	}
-	return colSerial, colRows;
+	return rids, colSerial, colRows;
 }
 
 // Usage: your_program.sh sample.db .dbinfo
@@ -430,7 +443,7 @@ func main() {
 		databaseFile.ReadAt(pageBytes, 0);
 
 		//!Never call this on first page:
-		_, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes)
+		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes)
 	
 		var names []string;
 		for _, row := range rowsContainingCols {
@@ -471,10 +484,10 @@ func main() {
 		databaseFile.ReadAt(pageBytes, 0);
 
 		//!Reading and interpretting sql schema table
-		_, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes);
+		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes);
 
 		var qTablePageNo int64;
-		var sqlStr string;
+		var sqlStr string;		
 		pageFound := false;	
 
 		for _, row := range rowsContainingCols {
@@ -491,8 +504,9 @@ func main() {
 			fmt.Println("Error, table not found");
 		}
 
-		_, colNames, _ := getTableDetailsFromSQLSchemaTable(sqlStr)
+		//fmt.Println(sqlStr);
 
+		_, colNames, _, autoincrementedKey := getTableDetailsFromSQLSchemaTable(sqlStr)
 		//!Mapping table colummn names to index
 		nameToInt := make(map[string]int)
 		for i, cn := range colNames {
@@ -511,8 +525,11 @@ func main() {
 			colAndCond := strings.Split(ps.Condition, "=");
 
 			for _, cc := range colAndCond {
-				cc = strings.Fields(cc)[0];
+				// cc = strings.Fields(cc)[0];
+				// cc = strings.Trim(cc, "'")
+				cc = strings.Trim(cc, " ")
 				cc = strings.Trim(cc, "'")
+				cc = strings.Trim(cc, " ")
 				ccns = append(ccns, cc);
 			}	
 		}
@@ -522,26 +539,35 @@ func main() {
 			firstPage = true;
 		}
 
-		//!Reading and interpretting sql schema table
-		_, qTableRows := readTable(databaseFile, int64(pageSize) , firstPage, tablePageBytes);	//!Assuming everything to be string for simplicity
+		ids, _, qTableRows := readTable(databaseFile, int64(pageSize) , firstPage, tablePageBytes);	//!Assuming everything to be string for simplicity
+
+		// for i, row := range qTableRows {
+		// 	fmt.Println(i, row);
+		// }
+
+
+
+		//fmt.Println("ccns1 is:", ccns[1]);
+
 		var keepRows [][]interface{};
-		for _, allCols := range qTableRows {
+		var keepRowsIds []int64;
+		for it, allCols := range qTableRows {
 			if(len(ccns) != 0) {
 				var colDetail string;
 				switch v := allCols[nameToInt[ccns[0]]].(type) {
 				case string:
 					colDetail = v;
 				default:
-					continue;
+					continue;	//!If not a string, skipping for now.
 				}
-				
-				//fmt.Println("temp: ", temp);
 				if colDetail == ccns[1]	{
-					//!I am assuming everything to be string here. Which it might not be
+					//fmt.Println(it, allCols);
 					keepRows = append(keepRows, allCols);
+					keepRowsIds = append(keepRowsIds, ids[it]);
 				}
 			} else {
 				keepRows = append(keepRows, allCols);				
+				keepRowsIds = append(keepRowsIds, ids[it]);
 			}
 		}
 
@@ -550,16 +576,19 @@ func main() {
 			fmt.Println(len(keepRows));
 		} else {
 		//!Extract relevant cols:
-			for _, allCols := range keepRows {
+			for iRow, allCols := range keepRows {				
 				var outString string;
 				for jin, col := range ps.Columns {
 					if(jin != 0) {
 						outString += "|"
 					}
+					var colContent string;
+					if(col == autoincrementedKey){
+						colContent = strconv.Itoa(int(keepRowsIds[iRow]))
+					} else {
+						colContent = allCols[nameToInt[col]].(string);
+					}
 					//currSerialType := colSerialType[nameToInt[col]];
-					//fmt.Println(currSerialType);
-					colContent := allCols[nameToInt[col]].(string);
-
 					outString += colContent;
 				}
 				fmt.Println(outString);
