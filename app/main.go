@@ -61,43 +61,6 @@ func parseSQL(query string) ParsedSQLQuery {
 	}
 }
 
-// func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string){
-// 	// Regex to extract table name and columns.
-// 	re := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(\w+)\s*\(\s*([^;]*)\s*\)`);
-// 	match := re.FindStringSubmatch(sql)
-// 	if len(match) < 3 {
-// 		log.Fatal("Failed to parse the SQL statement.")
-// 	}
-
-// 	// Extract table name and columns.
-// 	tableName := match[1]
-// 	columnsStr := match[2]
-
-// 	// Split columns by commas and trim spaces.
-// 	columns := strings.Split(columnsStr, ",")
-
-// 	// fmt.Printf("Table Name: %s\n", tableName)
-// 	// fmt.Println("Columns:")
-
-// 	// Iterate over columns and print them.
-// 	var colNames []string
-// 	var colContentTypes []string	
-// 	for _, col := range columns {
-// 		col = strings.TrimSpace(col) // Trim spaces around each column.
-// 		parts := strings.Fields(col) // Split column name and type.
-
-// 		if len(parts) >= 2 {
-// 			columnName := parts[0]
-// 			dataType := parts[1]
-// 			colNames = append(colNames, columnName);
-// 			colContentTypes = append(colContentTypes, dataType);
-// 		}
-// 	}
-
-// 	return tableName, colNames, colContentTypes;
-// }
-
-
 // Function to extract table details from a SQL schema string.
 func getTableDetailsFromSQLSchemaTable(sql string) (string, []string, []string, string) {
 	// Updated regex to handle escaped table names and complex column definitions.
@@ -271,6 +234,30 @@ func parseRecord(recordRaw []byte) ([]int64, []interface{}) {
 }
 
 
+func readIndexInteriorCell(pageBytes []byte, cellOffset uint16) (int64, []int64, []interface{}) {
+	pagePtrBytes := pageBytes[cellOffset: cellOffset + 4];
+	leftPointer := int64(binary.BigEndian.Uint32(pagePtrBytes));
+	cellOffset += 4; //Add size of left page.
+	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	currOffset := cellOffset + uint16(sizeBytesRead);
+	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
+
+	//!Parse this record
+	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
+	return leftPointer, cellColsSerialType, cellColsContent	
+}
+
+
+func readIndexLeafCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
+	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	currOffset := cellOffset + uint16(sizeBytesRead);
+	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
+
+	//!Parse this record
+	cellColsSerialType, cellColsContent := parseRecord(currCellPayloadBytes);
+	return cellColsSerialType, cellColsContent
+}
+
 //!Assuming it is cell of type ==> Table B-Tree Leaf Cell:
 //!Also assumption is that there is no overflow
 //!Does go pass value by reference or by value. Look into it.
@@ -287,8 +274,104 @@ func readTableLeafCell(pageBytes []byte, cellOffset uint16) (int64, []int64, []i
 	return int64(id), cellColsSerialType, cellColsContent
 }
 
+//!Code for reading index
 //!Never call this on first page:
-func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageBytes []byte) ([]int64, []int64, [][]interface{}) {
+func readIndex(databaseFile *os.File, pageSize int64, indexRootPageNo int64, equalCondition string) ([]int64, [][]interface{}) {
+
+	indexPageOffset := getPageOffset(indexRootPageNo, int64(pageSize));
+	currPageBytes := make([]byte, int64(pageSize));
+	databaseFile.ReadAt(currPageBytes, indexPageOffset);
+
+	currOffset := int64(0);
+	pageHeaderType := currPageBytes[currOffset]
+	cellsCount := int64(binary.BigEndian.Uint16(currPageBytes[currOffset + 3 : currOffset + 5]))
+
+	var rightmostChildPageNo int64;
+	var pageHeaderSizeInBytes int64;
+
+	if pageHeaderType == 0x02 {	//!Interior index
+		pageHeaderSizeInBytes = int64(12)
+		rightmostChildPageNo = int64(binary.BigEndian.Uint32(currPageBytes[currOffset + 8: currOffset + 12])) 
+
+	} else if pageHeaderType == 0x0a {
+		pageHeaderSizeInBytes = int64(8)	
+	} else {
+		fmt.Println("Error, not correct type");
+	}
+
+	currOffset += pageHeaderSizeInBytes;
+	//!Get pointers to all the cells.
+	cellPointers := make([]uint16, cellsCount);
+	for i := int64(0); i < cellsCount; i++ { 		//!2 bytes is the cell size		
+		cellPointers[i] = binary.BigEndian.Uint16(currPageBytes[currOffset + 2 * i : currOffset + 2 * (i + 1)])
+	}
+
+	//!If leaf, directly fetch the content and return, if not recurse.
+	if(pageHeaderType == 0x0a) {	//!Leaf page
+		var colRows [][]interface{};
+		var colSerial []int64;
+		for _, cellPointer := range cellPointers {
+			colSerialTypes, cellColsContent := readIndexLeafCell(currPageBytes, cellPointer)
+			if(cellColsContent[0].(string) == equalCondition) {
+				colRows = append(colRows, cellColsContent);
+				colSerial = colSerialTypes	//!Would be and should be same for every row.	
+			}
+
+		}
+		return colSerial, colRows;
+	}
+
+	// Index B-Tree Interior Cell (header 0x02):
+
+	// A 4-byte big-endian page number which is the left child pointer.
+	// A varint which is the total number of bytes of key payload, including any overflow
+	// The initial portion of the payload that does not spill to overflow pages.
+	// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
+
+	var colRows [][]interface{};
+	var colSerial []int64;
+
+	// //!Interior thing, get page no of children
+	// childrenPageNos := make([]int64, cellsCount + 1);	
+	var childrenPageNos []int64;	
+	for _, cellPointer := range cellPointers {
+		leftChildPageNo, colSerialTypes, cellColsContent := readIndexInteriorCell(currPageBytes, cellPointer);
+		//childrenPageNos[i], rowSerialTypes, rowColContents = readIndexInteriorCell(currPageBytes, cellPointer);
+		condName := cellColsContent[0].(string);
+		//condRowId = rowColContents[1];
+		if(condName == equalCondition) {
+			colRows = append(colRows, cellColsContent);
+			colSerial = colSerialTypes	//!Would be and should be same for every row.	
+			//!Equal left would be lesser, so don't add it.
+		} else if(condName > equalCondition) {
+			childrenPageNos = append(childrenPageNos, leftChildPageNo)
+		}
+	} 	
+	childrenPageNos = append(childrenPageNos, rightmostChildPageNo);
+
+	// var rids []int64;
+	for _, childPageNo := range childrenPageNos {
+		serialTypes, rowsContaingCols := readIndex(databaseFile, pageSize, childPageNo, equalCondition);
+		colRows = append(colRows, rowsContaingCols...)
+		colSerial = serialTypes;	//!Assuming they are all same.
+	}
+	// return rids, colSerial, colRows;
+	return colSerial, colRows;
+}
+
+//!Code for reading inedx ends.
+
+
+func readTable(databaseFile *os.File, pageSize int64 , tableRootPageNo int64) ([]int64, []int64, [][]interface{}) {
+	tablePageOffset := getPageOffset(tableRootPageNo, int64(pageSize));
+	currPageBytes := make([]byte, int64(pageSize));
+	databaseFile.ReadAt(currPageBytes, tablePageOffset);
+
+	firstPage := false;
+	if(tableRootPageNo == 1) {
+		firstPage = true;
+	}
+
 	//!Skip the fileHeader in case of page one.
 	var fileHeaderOffset int64
 	fileHeaderOffset = 0;
@@ -346,10 +429,10 @@ func readTable(databaseFile *os.File, pageSize int64 , firstPage bool, currPageB
 	var colSerial []int64;
 	var rids []int64;
 	for _, childPageNo := range childrenPageNos {
-		tablePageOffset := getPageOffset(childPageNo, pageSize);
-		tablePageBytes := make([]byte, int64(pageSize));
-		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
-		ids, serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, firstPage, tablePageBytes);
+		// tablePageOffset := getPageOffset(childPageNo, pageSize);
+		// tablePageBytes := make([]byte, int64(pageSize));
+		// databaseFile.ReadAt(tablePageBytes, tablePageOffset);
+		ids, serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, childPageNo);
 		colRows = append(colRows, rowsContaingCols...)
 		colSerial = serialTypes;	//!Assuming they are all same.
 		rids = append(rids, ids...)
@@ -442,8 +525,7 @@ func main() {
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
 
-		//!Never call this on first page:
-		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes)
+		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize), int64(1))
 	
 		var names []string;
 		for _, row := range rowsContainingCols {
@@ -484,8 +566,8 @@ func main() {
 		databaseFile.ReadAt(pageBytes, 0);
 
 		//!Reading and interpretting sql schema table
-		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes);
-		fmt.Println("Following are the table count: ", len(rowsContainingCols), "\n", rowsContainingCols);	//!For debugging.
+		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize), int64(1))
+		//fmt.Println("Following are the table count: ", len(rowsContainingCols), "\n", rowsContainingCols);	//!For debugging.
 		var qTablePageNo int64;
 		var sqlStr string;		
 		pageFound := false;	
@@ -535,13 +617,13 @@ func main() {
 
 		//!Find the index table if available
 		index_table_available := false;
-		var indexTablePageNo int64;
+		var indexPageNo int64;
 		for _, row := range rowsContainingCols {
 			//!Schema table consists of type, name, tbl_name, ... ...
 			nameCol := row[2].(string);	//!Should be two
 			typeCol := row[0].(string);
 			if(typeCol == "index" && nameCol == Q_tableName) {
-				indexTablePageNo = row[3].(int64);
+				indexPageNo = row[3].(int64);
 				index_table_available = true;		
 				break;
 			}
@@ -549,76 +631,72 @@ func main() {
 		
 		//!We are assuming type of index table is according to our search query:
 		//!Index table not available, do the whole search and apply WHERE clause afterwards,
+		var ids []int64
+		var qTableRows [][]interface{};
 		if(!index_table_available) {
+			ids, _, qTableRows = readTable(databaseFile, int64(pageSize),qTablePageNo);	//!Assuming everything to be string for simplicity
+		} else {
+			_, indexRows := readIndex(databaseFile, int64(pageSize), indexPageNo, ccns[1]);
+			//!This will basically give cols --> Country, rowID,
+			//!Now go through that table and directly to the relevant
 
-			//!Go to page of the asked table and fetch information of all the records.
-			//!Now going to the table page, and interpretting values:
-			tablePageOffset := getPageOffset(qTablePageNo, int64(pageSize));
-			tablePageBytes := make([]byte, int64(pageSize));
-			databaseFile.ReadAt(tablePageBytes, tablePageOffset);
-
-
-			firstPage := false;
-			if(qTablePageNo == 1) {
-				firstPage = true;
+			for _ , ir := range indexRows {
+				rowPageNo := ir[1].(int64);
+				lids, _, lqTableRows := readTable(databaseFile, int64(pageSize),rowPageNo);	//!Assuming everything to be string for simplicity				
+				ids = append(ids, lids...)
+				qTableRows = append(qTableRows, lqTableRows...)
 			}
-	
-			ids, _, qTableRows := readTable(databaseFile, int64(pageSize) , firstPage, tablePageBytes);	//!Assuming everything to be string for simplicity
-	
-			var keepRows [][]interface{};
-			var keepRowsIds []int64;
-			for it, allCols := range qTableRows {
-				if(len(ccns) != 0) {
-					var colDetail string;
-					switch v := allCols[nameToInt[ccns[0]]].(type) {
-					case string:
-						colDetail = v;
-					default:
-						continue;	//!If not a string, skipping for now.
-					}
-					if colDetail == ccns[1]	{
-						//fmt.Println(it, allCols);
-						keepRows = append(keepRows, allCols);
+		}
+			
+		var keepRows [][]interface{};
+		var keepRowsIds []int64;
+		for it, allCols := range qTableRows {
+			if(len(ccns) != 0) {
+				var colDetail string;
+				switch v := allCols[nameToInt[ccns[0]]].(type) {
+				case string:
+					colDetail = v;
+				default:
+					continue;	//!If not a string, skipping for now.
+				}
+				if colDetail == ccns[1]	{
+					//fmt.Println(it, allCols);
+					keepRows = append(keepRows, allCols);
+					if(len(ids) != 0) {
 						keepRowsIds = append(keepRowsIds, ids[it]);
 					}
-				} else {
-					keepRows = append(keepRows, allCols);				
+				}
+			} else {
+				keepRows = append(keepRows, allCols);				
+				if(len(ids) != 0) {
 					keepRowsIds = append(keepRowsIds, ids[it]);
 				}
 			}
-	
-			//!See if it is only asking for count
-			if len(ps.Columns) == 1 && (strings.HasPrefix(ps.Columns[0], "COUNT(") ||  strings.HasPrefix(ps.Columns[0], "count(")){
-				fmt.Println(len(keepRows));
-			} else {
-			//!Extract relevant cols:
-				for iRow, allCols := range keepRows {				
-					var outString string;
-					for jin, col := range ps.Columns {
-						if(jin != 0) {
-							outString += "|"
-						}
-						var colContent string;
-						if(col == autoincrementedKey){
-							colContent = strconv.Itoa(int(keepRowsIds[iRow]))
-						} else {
-							colContent = allCols[nameToInt[col]].(string);
-						}
-						//currSerialType := colSerialType[nameToInt[col]];
-						outString += colContent;
-					}
-					fmt.Println(outString);
-				}
-			}
-	
 		}
-
-
-		_ = indexTablePageNo;
-		
-
-
-
+	
+		//!See if it is only asking for count
+		if len(ps.Columns) == 1 && (strings.HasPrefix(ps.Columns[0], "COUNT(") ||  strings.HasPrefix(ps.Columns[0], "count(")){
+			fmt.Println(len(keepRows));
+		} else {
+		//!Extract relevant cols:
+			for iRow, allCols := range keepRows {				
+				var outString string;
+				for jin, col := range ps.Columns {
+					if(jin != 0) {
+						outString += "|"
+					}
+					var colContent string;
+					if(col == autoincrementedKey){
+						colContent = strconv.Itoa(int(keepRowsIds[iRow]))
+					} else {
+						colContent = allCols[nameToInt[col]].(string);
+					}
+					//currSerialType := colSerialType[nameToInt[col]];
+					outString += colContent;
+				}
+				fmt.Println(outString);
+			}
+		}
 		databaseFile.Close();
 	default:
 		fmt.Println("Unknown command", command)

@@ -10,9 +10,7 @@
             "request": "launch",
             "mode": "auto",
             "program": "${workspaceFolder}/app/main.go", // Change this to your main Go file
-            "args": [ "companies.db", "SELECT id, name FROM companies WHERE country = 'eritrea'"], // Custom arguments to pass to your application
-
-
+            "args": ["companies.db", "SELECT id, name FROM companies WHERE country = 'eritrea'"], // Custom arguments to pass to your application
             "cwd": "${workspaceFolder}", // Optional: working directory
             "stopOnEntry": true // Optional: whether to stop on the first line of the program
         }
