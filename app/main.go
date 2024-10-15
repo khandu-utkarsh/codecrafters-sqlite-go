@@ -485,15 +485,16 @@ func main() {
 
 		//!Reading and interpretting sql schema table
 		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize) , true, pageBytes);
-
+		fmt.Println("Following are the table count: ", len(rowsContainingCols), "\n", rowsContainingCols);	//!For debugging.
 		var qTablePageNo int64;
 		var sqlStr string;		
 		pageFound := false;	
 
 		for _, row := range rowsContainingCols {
 			//!Schema table consists of type, name, tbl_name, ... ...
-			nameCol := row[1].(string);
-			if(nameCol == Q_tableName) {
+			nameCol := row[2].(string);	//!Should be two
+			typeCol := row[0].(string);
+			if(typeCol == "table" && nameCol == Q_tableName) {
 				qTablePageNo = row[3].(int64);
 				sqlStr = row[4].(string);
 				pageFound = true;		
@@ -504,6 +505,7 @@ func main() {
 			fmt.Println("Error, table not found");
 		}
 
+
 		//fmt.Println(sqlStr);
 
 		_, colNames, _, autoincrementedKey := getTableDetailsFromSQLSchemaTable(sqlStr)
@@ -513,12 +515,7 @@ func main() {
 			nameToInt[cn] = i;
 		}
 
-		//!Go to page of the asked table and fetch information of all the records.
-		//!Now going to the table page, and interpretting values:
-		tablePageOffset := getPageOffset(qTablePageNo, int64(pageSize));
-		tablePageBytes := make([]byte, int64(pageSize));
-		databaseFile.ReadAt(tablePageBytes, tablePageOffset);
-		
+
 		//!Assuming simple conditions for where without AND and other things.
 		var ccns []string;
 		if(ps.Condition != "") {
@@ -534,66 +531,93 @@ func main() {
 			}	
 		}
 
-		firstPage := false;
-		if(qTablePageNo == 1) {
-			firstPage = true;
+
+
+		//!Find the index table if available
+		index_table_available := false;
+		var indexTablePageNo int64;
+		for _, row := range rowsContainingCols {
+			//!Schema table consists of type, name, tbl_name, ... ...
+			nameCol := row[2].(string);	//!Should be two
+			typeCol := row[0].(string);
+			if(typeCol == "index" && nameCol == Q_tableName) {
+				indexTablePageNo = row[3].(int64);
+				index_table_available = true;		
+				break;
+			}
 		}
+		
+		//!We are assuming type of index table is according to our search query:
+		//!Index table not available, do the whole search and apply WHERE clause afterwards,
+		if(!index_table_available) {
 
-		ids, _, qTableRows := readTable(databaseFile, int64(pageSize) , firstPage, tablePageBytes);	//!Assuming everything to be string for simplicity
+			//!Go to page of the asked table and fetch information of all the records.
+			//!Now going to the table page, and interpretting values:
+			tablePageOffset := getPageOffset(qTablePageNo, int64(pageSize));
+			tablePageBytes := make([]byte, int64(pageSize));
+			databaseFile.ReadAt(tablePageBytes, tablePageOffset);
 
-		// for i, row := range qTableRows {
-		// 	fmt.Println(i, row);
-		// }
 
-
-
-		//fmt.Println("ccns1 is:", ccns[1]);
-
-		var keepRows [][]interface{};
-		var keepRowsIds []int64;
-		for it, allCols := range qTableRows {
-			if(len(ccns) != 0) {
-				var colDetail string;
-				switch v := allCols[nameToInt[ccns[0]]].(type) {
-				case string:
-					colDetail = v;
-				default:
-					continue;	//!If not a string, skipping for now.
-				}
-				if colDetail == ccns[1]	{
-					//fmt.Println(it, allCols);
-					keepRows = append(keepRows, allCols);
+			firstPage := false;
+			if(qTablePageNo == 1) {
+				firstPage = true;
+			}
+	
+			ids, _, qTableRows := readTable(databaseFile, int64(pageSize) , firstPage, tablePageBytes);	//!Assuming everything to be string for simplicity
+	
+			var keepRows [][]interface{};
+			var keepRowsIds []int64;
+			for it, allCols := range qTableRows {
+				if(len(ccns) != 0) {
+					var colDetail string;
+					switch v := allCols[nameToInt[ccns[0]]].(type) {
+					case string:
+						colDetail = v;
+					default:
+						continue;	//!If not a string, skipping for now.
+					}
+					if colDetail == ccns[1]	{
+						//fmt.Println(it, allCols);
+						keepRows = append(keepRows, allCols);
+						keepRowsIds = append(keepRowsIds, ids[it]);
+					}
+				} else {
+					keepRows = append(keepRows, allCols);				
 					keepRowsIds = append(keepRowsIds, ids[it]);
 				}
-			} else {
-				keepRows = append(keepRows, allCols);				
-				keepRowsIds = append(keepRowsIds, ids[it]);
 			}
+	
+			//!See if it is only asking for count
+			if len(ps.Columns) == 1 && (strings.HasPrefix(ps.Columns[0], "COUNT(") ||  strings.HasPrefix(ps.Columns[0], "count(")){
+				fmt.Println(len(keepRows));
+			} else {
+			//!Extract relevant cols:
+				for iRow, allCols := range keepRows {				
+					var outString string;
+					for jin, col := range ps.Columns {
+						if(jin != 0) {
+							outString += "|"
+						}
+						var colContent string;
+						if(col == autoincrementedKey){
+							colContent = strconv.Itoa(int(keepRowsIds[iRow]))
+						} else {
+							colContent = allCols[nameToInt[col]].(string);
+						}
+						//currSerialType := colSerialType[nameToInt[col]];
+						outString += colContent;
+					}
+					fmt.Println(outString);
+				}
+			}
+	
 		}
 
-		//!See if it is only asking for count
-		if len(ps.Columns) == 1 && (strings.HasPrefix(ps.Columns[0], "COUNT(") ||  strings.HasPrefix(ps.Columns[0], "count(")){
-			fmt.Println(len(keepRows));
-		} else {
-		//!Extract relevant cols:
-			for iRow, allCols := range keepRows {				
-				var outString string;
-				for jin, col := range ps.Columns {
-					if(jin != 0) {
-						outString += "|"
-					}
-					var colContent string;
-					if(col == autoincrementedKey){
-						colContent = strconv.Itoa(int(keepRowsIds[iRow]))
-					} else {
-						colContent = allCols[nameToInt[col]].(string);
-					}
-					//currSerialType := colSerialType[nameToInt[col]];
-					outString += colContent;
-				}
-				fmt.Println(outString);
-			}
-		}
+
+		_ = indexTablePageNo;
+		
+
+
 
 		databaseFile.Close();
 	default:
