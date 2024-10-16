@@ -192,9 +192,9 @@ func interpretBytes(serialType int64, raw []byte) (int64, interface{}) {
 		floatVal64 := math.Float64frombits(binary.BigEndian.Uint64(raw[:8]));
 		return 8, floatVal64;
 	case 8:
-		return 0, 0
+		return 0, int64(0)
 	case 9:
-		return 0, 0
+		return 0, int64(0)
 	default:
 		if serialType%2 == 0 && serialType >= 12 {
 			serialBytesCount := (serialType - 12) / 2
@@ -238,7 +238,8 @@ func readIndexInteriorCell(pageBytes []byte, cellOffset uint16) (int64, []int64,
 	pagePtrBytes := pageBytes[cellOffset: cellOffset + 4];
 	leftPointer := int64(binary.BigEndian.Uint32(pagePtrBytes));
 	cellOffset += 4; //Add size of left page.
-	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	//payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : ]);	
 	currOffset := cellOffset + uint16(sizeBytesRead);
 	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
 
@@ -249,7 +250,8 @@ func readIndexInteriorCell(pageBytes []byte, cellOffset uint16) (int64, []int64,
 
 
 func readIndexLeafCell(pageBytes []byte, cellOffset uint16) ([]int64, []interface{}) {
-	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	//payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset :]);	
 	currOffset := cellOffset + uint16(sizeBytesRead);
 	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
 
@@ -263,9 +265,10 @@ func readIndexLeafCell(pageBytes []byte, cellOffset uint16) ([]int64, []interfac
 //!Does go pass value by reference or by value. Look into it.
 func readTableLeafCell(pageBytes []byte, cellOffset uint16) (int64, []int64, []interface{}) {
 	payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset : cellOffset + 9]);
+	//payloadSizeInBytes, sizeBytesRead := ReadVarint(pageBytes[cellOffset :]);	
 	currOffset := cellOffset + uint16(sizeBytesRead);
 	id, rowIdBytesRead := ReadVarint(pageBytes[currOffset : currOffset + 9]);
-
+	//id, rowIdBytesRead := ReadVarint(pageBytes[currOffset : ]);
 	currOffset += uint16(rowIdBytesRead);
 	currCellPayloadBytes := pageBytes[int64(currOffset) : int64(currOffset) + int64(payloadSizeInBytes)];
 
@@ -312,10 +315,12 @@ func readIndex(databaseFile *os.File, pageSize int64, indexRootPageNo int64, equ
 	if(pageHeaderType == 0x0a) {	//!Leaf page
 		var outputKeys []int64;
 		for _, cellPointer := range cellPointers {
-			_, cellColsContent := readIndexLeafCell(currPageBytes, cellPointer)
-			if(cellColsContent[0].(string) == equalCondition) {
-				ok := cellColsContent[1].(int64);				
-				outputKeys = append(outputKeys, ok);
+			serialType, cellColsContent := readIndexLeafCell(currPageBytes, cellPointer)
+			if(serialType[0] != 0) {
+				if(cellColsContent[0].(string) == equalCondition) {
+					ok := cellColsContent[1].(int64);				
+					outputKeys = append(outputKeys, ok);
+				}
 			}
 		}
 		return outputKeys;
@@ -329,8 +334,13 @@ func readIndex(databaseFile *os.File, pageSize int64, indexRootPageNo int64, equ
 	var cellLeftPageNos []int64;
 
 	for _, cellPointer := range cellPointers {
-		leftChildPageNo, _, cellColsContent := readIndexInteriorCell(currPageBytes, cellPointer);
-		condName := cellColsContent[0].(string);
+		leftChildPageNo, serialType, cellColsContent := readIndexInteriorCell(currPageBytes, cellPointer);
+		var condName  string;
+		if(serialType[0] == 0) {
+			condName = "nil"
+		} else {
+			condName = cellColsContent[0].(string);
+		}
 		cellKey := cellColsContent[1].(int64);
 		cellConds = append(cellConds, condName);
 		cellKeys = append(cellKeys, cellKey);
