@@ -276,7 +276,7 @@ func readTableLeafCell(pageBytes []byte, cellOffset uint16) (int64, []int64, []i
 
 //!Code for reading index
 //!Never call this on first page:
-func readIndex(databaseFile *os.File, pageSize int64, indexRootPageNo int64, equalCondition string) ([]int64, [][]interface{}) {
+func readIndex(databaseFile *os.File, pageSize int64, indexRootPageNo int64, equalCondition string) ([]int64) {
 
 	indexPageOffset := getPageOffset(indexRootPageNo, int64(pageSize));
 	currPageBytes := make([]byte, int64(pageSize));
@@ -306,63 +306,79 @@ func readIndex(databaseFile *os.File, pageSize int64, indexRootPageNo int64, equ
 		cellPointers[i] = binary.BigEndian.Uint16(currPageBytes[currOffset + 2 * i : currOffset + 2 * (i + 1)])
 	}
 
+	//!This is a leaf page. Get the matching one and return.
+
 	//!If leaf, directly fetch the content and return, if not recurse.
 	if(pageHeaderType == 0x0a) {	//!Leaf page
-		var colRows [][]interface{};
-		var colSerial []int64;
+		var outputKeys []int64;
 		for _, cellPointer := range cellPointers {
-			colSerialTypes, cellColsContent := readIndexLeafCell(currPageBytes, cellPointer)
+			_, cellColsContent := readIndexLeafCell(currPageBytes, cellPointer)
 			if(cellColsContent[0].(string) == equalCondition) {
-				colRows = append(colRows, cellColsContent);
-				colSerial = colSerialTypes	//!Would be and should be same for every row.	
+				ok := cellColsContent[1].(int64);				
+				outputKeys = append(outputKeys, ok);
 			}
-
 		}
-		return colSerial, colRows;
+		return outputKeys;
 	}
 
-	// Index B-Tree Interior Cell (header 0x02):
+	var outKeys []int64;
+	
 
-	// A 4-byte big-endian page number which is the left child pointer.
-	// A varint which is the total number of bytes of key payload, including any overflow
-	// The initial portion of the payload that does not spill to overflow pages.
-	// A 4-byte big-endian integer page number for the first page of the overflow page list - omitted if all payload fits on the b-tree page.
+	var cellConds []string;
+	var cellKeys []int64;
+	var cellLeftPageNos []int64;
 
-	var colRows [][]interface{};
-	var colSerial []int64;
-
-	// //!Interior thing, get page no of children
-	// childrenPageNos := make([]int64, cellsCount + 1);	
-	var childrenPageNos []int64;	
 	for _, cellPointer := range cellPointers {
-		leftChildPageNo, colSerialTypes, cellColsContent := readIndexInteriorCell(currPageBytes, cellPointer);
-		//childrenPageNos[i], rowSerialTypes, rowColContents = readIndexInteriorCell(currPageBytes, cellPointer);
+		leftChildPageNo, _, cellColsContent := readIndexInteriorCell(currPageBytes, cellPointer);
 		condName := cellColsContent[0].(string);
-		//condRowId = rowColContents[1];
-		if(condName == equalCondition) {
-			colRows = append(colRows, cellColsContent);
-			colSerial = colSerialTypes	//!Would be and should be same for every row.	
-			//!Equal left would be lesser, so don't add it.
-		} else if(condName > equalCondition) {
-			childrenPageNos = append(childrenPageNos, leftChildPageNo)
-		}
-	} 	
-	childrenPageNos = append(childrenPageNos, rightmostChildPageNo);
+		cellKey := cellColsContent[1].(int64);
+		cellConds = append(cellConds, condName);
+		cellKeys = append(cellKeys, cellKey);
+		cellLeftPageNos = append(cellLeftPageNos, leftChildPageNo);
+	}
 
 	// var rids []int64;
-	for _, childPageNo := range childrenPageNos {
-		serialTypes, rowsContaingCols := readIndex(databaseFile, pageSize, childPageNo, equalCondition);
-		colRows = append(colRows, rowsContaingCols...)
-		colSerial = serialTypes;	//!Assuming they are all same.
+	for iCell, childPageNo := range cellLeftPageNos {
+		currOutKeys := readIndex(databaseFile, pageSize, childPageNo, equalCondition);
+		outKeys = append(outKeys, currOutKeys...);
+		if(cellConds[iCell] == equalCondition) {
+			outKeys = append(outKeys, cellKeys[iCell]);
+		}
 	}
-	// return rids, colSerial, colRows;
-	return colSerial, colRows;
+
+	currOutKeys := readIndex(databaseFile, pageSize, rightmostChildPageNo, equalCondition);
+	outKeys = append(outKeys, currOutKeys...);
+
+	return outKeys;
 }
 
 //!Code for reading inedx ends.
+func ConsiderInterval(leftKey int64, rightKey int64, table map[int64]int64) bool {
+	if(leftKey == -1) {
+		for k , _ := range table {
+			if (k <= rightKey) {
+				return true;
+			}
+		}
+	} else if(rightKey == -1) {
+		for k , _ := range table {
+			if (k > leftKey) {
+				return true;
+			}
+		}
+	} else {
+		for k , _ := range table {
+			if (k <= rightKey && k > leftKey) {
+				return true;
+			}
+		}		
+
+	}
+	return false
+}
 
 
-func readTable(databaseFile *os.File, pageSize int64 , tableRootPageNo int64) ([]int64, []int64, [][]interface{}) {
+func readTable(databaseFile *os.File, pageSize int64 , tableRootPageNo int64, toFetchKeyMaps map[int64]int64) ([]int64, []int64, [][]interface{}) {
 	tablePageOffset := getPageOffset(tableRootPageNo, int64(pageSize));
 	currPageBytes := make([]byte, int64(pageSize));
 	databaseFile.ReadAt(currPageBytes, tablePageOffset);
@@ -409,33 +425,76 @@ func readTable(databaseFile *os.File, pageSize int64 , tableRootPageNo int64) ([
 		var ids []int64;
 		for _, cellPointer := range cellPointers {
 			id, colSerialTypes, cellColsContent := readTableLeafCell(currPageBytes, cellPointer);
-			colRows = append(colRows, cellColsContent);
-			colSerial = colSerialTypes	//!Would be and should be same for every row.
-			ids = append(ids, id);
+						
+			if(len(toFetchKeyMaps) != 0) {
+				_, yes := toFetchKeyMaps[id];
+				if(yes) {
+					colRows = append(colRows, cellColsContent);
+					colSerial = colSerialTypes	//!Would be and should be same for every row.
+					ids = append(ids, id);
+				}				
+			} else {
+				colRows = append(colRows, cellColsContent);
+				colSerial = colSerialTypes	//!Would be and should be same for every row.
+				ids = append(ids, id);
+			}
 		}
 		return ids, colSerial, colRows;
 	}
 
 	//!Interior thing, get page no of children
 	childrenPageNos := make([]int64, cellsCount + 1);		
+	cellKeys := make([]int64, cellsCount);
+	toConsiderIntervals := make([]bool, cellsCount + 1);
+	if(len(toFetchKeyMaps) != 0) {
+		for ind, _ := range toConsiderIntervals {
+			toConsiderIntervals[ind] = false;
+		}
+	} else {
+		for ind, _ := range toConsiderIntervals {
+			toConsiderIntervals[ind] = true;
+		}		
+	}
 	for i, cellPointer := range cellPointers {
 		pagePtrBytes := currPageBytes[cellPointer: cellPointer + 4];
 		childrenPageNos[i] = int64(binary.BigEndian.Uint32(pagePtrBytes));
-		//_, rowIdBytesRead := ReadVarint(currPageBytes[cellPointer + 4 : cellPointer + 4 + 9]);	//!Not needed rn!!
+
+		rowIdBytes := currPageBytes[cellPointer + 4 : ];
+		interiorRowId, _ := ReadVarint(rowIdBytes);	//!Not needed rn!!
+		cellKeys[i] = int64(interiorRowId);
 	} 	
+
+	if(len(toFetchKeyMaps) != 0) {
+		for intIndex, _ := range toConsiderIntervals {
+			if(intIndex == 0) {	//!Left most interval
+				if(ConsiderInterval(int64(-1), cellKeys[intIndex], toFetchKeyMaps)) {
+					toConsiderIntervals[intIndex] = true;
+				}
+			} else if (intIndex == int(cellsCount)) {
+				if(ConsiderInterval(cellKeys[intIndex - 1], int64(-1), toFetchKeyMaps)) {
+					toConsiderIntervals[intIndex] = true;
+				}
+			} else {
+				if(ConsiderInterval(cellKeys[intIndex - 1], cellKeys[intIndex], toFetchKeyMaps)) {
+					toConsiderIntervals[intIndex] = true;
+				}
+			}
+		}
+	}
+
 	childrenPageNos[cellsCount] = rightmostChildPageNo;
 
 	var colRows [][]interface{};
 	var colSerial []int64;
 	var rids []int64;
-	for _, childPageNo := range childrenPageNos {
-		// tablePageOffset := getPageOffset(childPageNo, pageSize);
-		// tablePageBytes := make([]byte, int64(pageSize));
-		// databaseFile.ReadAt(tablePageBytes, tablePageOffset);
-		ids, serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, childPageNo);
-		colRows = append(colRows, rowsContaingCols...)
-		colSerial = serialTypes;	//!Assuming they are all same.
-		rids = append(rids, ids...)
+	for intIndex, intSelection := range toConsiderIntervals {
+		if(intSelection) {
+			childPageNo := childrenPageNos[intIndex];
+			ids, serialTypes, rowsContaingCols := readTable(databaseFile, pageSize, childPageNo, toFetchKeyMaps);
+			colRows = append(colRows, rowsContaingCols...)
+			colSerial = serialTypes;	//!Assuming they are all same.
+			rids = append(rids, ids...)
+		}
 	}
 	return rids, colSerial, colRows;
 }
@@ -525,7 +584,8 @@ func main() {
 		pageBytes := make([]byte, int64(pageSize));
 		databaseFile.ReadAt(pageBytes, 0);
 
-		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize), int64(1))
+		ftable := make(map[int64]int64);
+		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize), int64(1), ftable)
 	
 		var names []string;
 		for _, row := range rowsContainingCols {
@@ -566,7 +626,8 @@ func main() {
 		databaseFile.ReadAt(pageBytes, 0);
 
 		//!Reading and interpretting sql schema table
-		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize), int64(1))
+		ftable := make(map[int64]int64);
+		_, _, rowsContainingCols := readTable(databaseFile, int64(pageSize), int64(1), ftable);
 		//fmt.Println("Following are the table count: ", len(rowsContainingCols), "\n", rowsContainingCols);	//!For debugging.
 		var qTablePageNo int64;
 		var sqlStr string;		
@@ -634,18 +695,18 @@ func main() {
 		var ids []int64
 		var qTableRows [][]interface{};
 		if(!index_table_available) {
-			ids, _, qTableRows = readTable(databaseFile, int64(pageSize),qTablePageNo);	//!Assuming everything to be string for simplicity
-		} else {
-			_, indexRows := readIndex(databaseFile, int64(pageSize), indexPageNo, ccns[1]);
-			//!This will basically give cols --> Country, rowID,
-			//!Now go through that table and directly to the relevant
-
-			for _ , ir := range indexRows {
-				rowPageNo := ir[1].(int64);
-				lids, _, lqTableRows := readTable(databaseFile, int64(pageSize),rowPageNo);	//!Assuming everything to be string for simplicity				
-				ids = append(ids, lids...)
-				qTableRows = append(qTableRows, lqTableRows...)
+			ftable := make(map[int64]int64);
+			ids, _, qTableRows = readTable(databaseFile, int64(pageSize),qTablePageNo, ftable);	//!Assuming everything to be string for simplicity
+		} else {			
+			foundKeys := readIndex(databaseFile, int64(pageSize), indexPageNo, ccns[1]);
+			//fmt.Println(foundKeys);
+			ftable := make(map[int64]int64);
+			for _, key := range foundKeys {
+				ftable[key] = key;
 			}
+			//!This will definitely be sorted because of the way I am populating these:w
+			//fmt.Println(foundKeys, ftable);
+			ids, _, qTableRows = readTable(databaseFile, int64(pageSize),qTablePageNo, ftable);	//!Assuming everything to be string for simplicity
 		}
 			
 		var keepRows [][]interface{};
